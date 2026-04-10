@@ -376,38 +376,22 @@ function buildLaunchOffsetSelect() {
 
 function buildLaunchPlanFromOffsetEmbed(
   groupName,
-  offsetSeconds,
-  longestLaunchTime,
   arrivalTime,
-  selectedLeads
+  leads
 ) {
-  const lines = selectedLeads
+  const lines = leads
     .map((lead) => {
       const launchTime = new Date(
         arrivalTime.getTime() - getTotalTravelSeconds(lead) * 1000
       );
 
-      return `${lead.gameName} - ${formatUtcTime(launchTime)} (${formatCountdownToDate(
-        launchTime
-      )})`;
+      return `${lead.gameName} - ${formatUtcTime(launchTime)}`;
     })
     .join('\n');
 
   return new EmbedBuilder()
     .setTitle(`${groupName} Launch Plan`)
-    .setDescription(
-      [
-        `Longest rally starts in **${offsetSeconds}s**`,
-        `Longest launch: ${formatUtcTime(longestLaunchTime)} (${formatCountdownToDate(
-          longestLaunchTime
-        )})`,
-        `Land time: ${formatUtcTime(arrivalTime)} (${formatCountdownToDate(
-          arrivalTime
-        )})`,
-        '',
-        lines,
-      ].join('\n')
-    );
+    .setDescription(lines);
 }
 
 async function refreshDashboardMessage(force = false) {
