@@ -454,10 +454,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (interaction.customId === 'dashboard:refresh') {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         await refreshDashboardMessage();
-        await interaction.editReply({
+        await interaction.reply({
           content: 'Dashboard refreshed.',
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -537,13 +537,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (interaction.customId === 'group:assign_select_lead') {
-        await interaction.deferUpdate();
-
         const userId = interaction.values[0];
         const session = sessions.get(interaction.user.id);
 
         if (!session?.groupName) {
-          await interaction.followUp({
+          await interaction.reply({
             content: 'Your session expired. Please start again.',
             flags: MessageFlags.Ephemeral,
           });
@@ -558,9 +556,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const targetGroup = groups.find((g) => g.name === session.groupName);
         if (!targetGroup) {
-          await interaction.followUp({
+          await interaction.update({
             content: 'Group not found.',
-            flags: MessageFlags.Ephemeral,
+            components: [],
           });
           return;
         }
@@ -576,9 +574,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const leads = loadLeads();
         const lead = leads.find((l) => l.userId === userId);
 
-        await interaction.followUp({
+        await interaction.update({
           content: `Assigned **${lead?.gameName || userId}** to **${targetGroup.name}**.`,
-          flags: MessageFlags.Ephemeral,
+          components: [],
         });
         return;
       }
@@ -597,11 +595,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (interaction.customId === 'group:calculate_select_offset') {
-        await interaction.deferUpdate();
-
         const session = sessions.get(interaction.user.id);
         if (!session?.groupName) {
-          await interaction.followUp({
+          await interaction.reply({
             content: 'Your session expired. Please start again.',
             flags: MessageFlags.Ephemeral,
           });
@@ -614,9 +610,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const group = groups.find((g) => g.name === session.groupName);
 
         if (!group) {
-          await interaction.followUp({
+          await interaction.update({
             content: 'Group not found.',
-            flags: MessageFlags.Ephemeral,
+            components: [],
           });
           return;
         }
@@ -626,9 +622,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .filter(Boolean);
 
         if (groupLeads.length === 0) {
-          await interaction.followUp({
+          await interaction.update({
             content: 'That group has no rally leads assigned.',
-            flags: MessageFlags.Ephemeral,
+            components: [],
           });
           return;
         }
@@ -654,9 +650,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const channel = await client.channels.fetch(SVS_CHANNEL_ID);
         if (!channel || !channel.isTextBased()) {
-          await interaction.followUp({
+          await interaction.update({
             content: 'SvS channel is not available.',
-            flags: MessageFlags.Ephemeral,
+            components: [],
           });
           return;
         }
@@ -676,9 +672,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         sessions.delete(interaction.user.id);
         await refreshDashboardMessage();
 
-        await interaction.followUp({
+        await interaction.update({
           content: `Launch plan posted for **${group.name}**.`,
-          flags: MessageFlags.Ephemeral,
+          components: [],
         });
         return;
       }
@@ -686,23 +682,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.type === InteractionType.ModalSubmit) {
       if (interaction.customId === 'lead:register_modal') {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
         const gameName = interaction.fields.getTextInputValue('game_name').trim();
         const rallySeconds = Number(
           interaction.fields.getTextInputValue('rally_seconds').trim()
         );
 
         if (!gameName) {
-          await interaction.editReply({
+          await interaction.reply({
             content: 'Game Name is required.',
+            flags: MessageFlags.Ephemeral,
           });
           return;
         }
 
         if (!Number.isFinite(rallySeconds) || rallySeconds <= 0) {
-          await interaction.editReply({
+          await interaction.reply({
             content: 'Rally Time must be a valid number greater than 0.',
+            flags: MessageFlags.Ephemeral,
           });
           return;
         }
@@ -716,8 +712,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         await refreshDashboardMessage();
 
-        await interaction.editReply({
+        await interaction.reply({
           content: `Registered **${gameName}** with rally time **${rallySeconds}s**.`,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
