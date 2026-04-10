@@ -25,6 +25,9 @@ const RALLY_MANAGER_ROLE_NAME =
   process.env.RALLY_MANAGER_ROLE_NAME || 'Rally Lead';
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 
+// How long to keep a plan visible after its call time has passed
+const PLAN_HIGHLIGHT_SECONDS = 8;
+
 if (!TOKEN || !SVS_CHANNEL_ID) {
   console.error('Missing required environment variables.');
   process.exit(1);
@@ -51,7 +54,6 @@ let leads = [];
 let groups = [];
 let uiState = {
   dashboardMessageId: null,
-  selectedGroupName: 'ST8 Rally 1',
 };
 
 let refreshInFlight = false;
@@ -99,7 +101,7 @@ function loadGroupsFromDisk() {
     leadUserIds: [],
     lastArrivalTime: null,
     lastCalculatedAt: null,
-    lastPlanLines: [],
+    lastPlanRows: [],
   }));
 
   const loaded = readJson(groupsPath, defaultGroups);
@@ -113,7 +115,7 @@ function loadGroupsFromDisk() {
         leadUserIds: [],
         lastArrivalTime: null,
         lastCalculatedAt: null,
-        lastPlanLines: [],
+        lastPlanRows: [],
       });
       changed = true;
     }
@@ -128,8 +130,8 @@ function loadGroupsFromDisk() {
       group.lastCalculatedAt = null;
       changed = true;
     }
-    if (!Object.prototype.hasOwnProperty.call(group, 'lastPlanLines')) {
-      group.lastPlanLines = [];
+    if (!Object.prototype.hasOwnProperty.call(group, 'lastPlanRows')) {
+      group.lastPlanRows = [];
       changed = true;
     }
   }
@@ -148,12 +150,7 @@ function saveGroupsToDisk() {
 function loadUiStateFromDisk() {
   uiState = readJson(uiStatePath, {
     dashboardMessageId: null,
-    selectedGroupName: 'ST8 Rally 1',
   });
-
-  if (!uiState.selectedGroupName) {
-    uiState.selectedGroupName = 'ST8 Rally 1';
-  }
 }
 
 function saveUiStateToDisk() {
@@ -205,6 +202,10 @@ function roundUpToNext15Seconds(date) {
 
 function getTotalTravelSeconds(lead) {
   return 300 + Number(lead.rallySeconds || 0);
+}
+
+function getLeadByStoredId(id) {
+  return leads.find((lead) => lead.userId === id || lead.manualId === id);
 }
 
 function upsertLeadInMemory({ userId, discordName, gameName, rallySeconds }) {
@@ -265,44 +266,26 @@ function upsertManualLeadInMemory({ gameName, rallySeconds, discordUserId }) {
   saveLeadsToDisk();
 }
 
-function getLeadByStoredId(id) {
-  return leads.find((lead) => lead.userId === id || lead.manualId === id);
-}
-
-function buildPlanLinesForGroup(arrivalTime, selectedLeads) {
-  const rows = selectedLeads
-    .map((lead) => {
-      const launchTime = new Date(
-        arrivalTime.getTime() - getTotalTravelSeconds(lead) * 1000
-      );
-
-      return {
-        gameName: lead.gameName,
-        launchTime,
-      };
-    })
-    .sort((a, b) => a.launchTime.getTime() - b.launchTime.getTime());
-
-  const longestName = Math.max(...rows.map((r) => r.gameName.length), 4);
-
-  return rows.map((row) => {
-    const paddedName = row.gameName.padEnd(longestName, ' ');
-    return `${paddedName} - ${formatUtcTime(row.launchTime)}`;
-  });
-}
-
 function clearExpiredPlans() {
   const now = Date.now();
   let changed = false;
 
   for (const group of groups) {
-    if (!group.lastArrivalTime) continue;
+    if (!Array.isArray(group.lastPlanRows) || group.lastPlanRows.length === 0) {
+      continue;
+    }
 
-    const landTime = new Date(group.lastArrivalTime).getTime();
-    if (!Number.isNaN(landTime) && landTime <= now) {
+    const latestCall = Math.max(
+      ...group.lastPlanRows.map((row) => new Date(row.callTime).getTime())
+    );
+
+    if (
+      Number.isFinite(latestCall) &&
+      now > latestCall + PLAN_HIGHLIGHT_SECONDS * 1000
+    ) {
       group.lastArrivalTime = null;
       group.lastCalculatedAt = null;
-      group.lastPlanLines = [];
+      group.lastPlanRows = [];
       changed = true;
     }
   }
@@ -312,45 +295,49 @@ function clearExpiredPlans() {
   }
 }
 
-function buildSendTimeSection() {
-  const selectedGroup =
-    groups.find((g) => g.name === uiState.selectedGroupName) || groups[0];
+function buildPlanRowsForGroup(arrivalTime, selectedLeads) {
+  return selectedLeads
+    .map((lead) => {
+      const callTime = new Date(
+        arrivalTime.getTime() - getTotalTravelSeconds(lead) * 1000
+      );
 
-  if (!selectedGroup) {
-    return [
-      '**📨 Send Time Info**',
-      'No groups found.',
-    ].join('\n');
+      return {
+        gameName: lead.gameName,
+        callTime: callTime.toISOString(),
+      };
+    })
+    .sort((a, b) => new Date(a.callTime) - new Date(b.callTime));
+}
+
+function buildGroupPlanFieldValue(group) {
+  if (!Array.isArray(group.lastPlanRows) || group.lastPlanRows.length === 0) {
+    return 'No active plan.';
   }
 
-  const landDate = selectedGroup.lastArrivalTime
-    ? new Date(selectedGroup.lastArrivalTime)
-    : null;
+  const now = Date.now();
+  const visibleRows = group.lastPlanRows
+    .filter((row) => {
+      const callTime = new Date(row.callTime).getTime();
+      return (
+        Number.isFinite(callTime) &&
+        now <= callTime + PLAN_HIGHLIGHT_SECONDS * 1000
+      );
+    });
 
-  const hasActivePlan =
-    landDate &&
-    !Number.isNaN(landDate.getTime()) &&
-    landDate.getTime() > Date.now() &&
-    Array.isArray(selectedGroup.lastPlanLines) &&
-    selectedGroup.lastPlanLines.length > 0;
-
-  if (!hasActivePlan) {
-    return [
-      '**📨 Send Time Info**',
-      `${selectedGroup.name}`,
-      'No active launch plan.',
-    ].join('\n');
+  if (visibleRows.length === 0) {
+    return 'No active plan.';
   }
 
-  return [
-    '**📨 Send Time Info**',
-    `${selectedGroup.name}`,
-    `🎯 Land: ${formatUtcTime(landDate)} (${formatCountdownToDate(landDate)})`,
-    '',
-    '```',
-    ...selectedGroup.lastPlanLines,
-    '```',
-  ].join('\n');
+  return visibleRows
+    .map((row) => {
+      const callDate = new Date(row.callTime);
+      const isCalled = now >= callDate.getTime();
+      const prefix = isCalled ? '🟨 ' : '';
+      const suffix = isCalled ? ' **CALL NOW**' : '';
+      return `${prefix}${row.gameName} - ${formatUtcTime(callDate)}${suffix}`;
+    })
+    .join('\n');
 }
 
 function buildDashboardDescription() {
@@ -402,15 +389,56 @@ function buildDashboardDescription() {
     '',
     '**🧩 Groups**',
     groupText,
-    '',
-    buildSendTimeSection(),
   ].join('\n');
 }
 
 function buildDashboardEmbed() {
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setTitle('SvS Command Dashboard')
     .setDescription(buildDashboardDescription());
+
+  embed.addFields(
+    {
+      name: '📨 ST8 Rally 1',
+      value: buildGroupPlanFieldValue(
+        groups.find((g) => g.name === 'ST8 Rally 1') || { lastPlanRows: [] }
+      ),
+      inline: true,
+    },
+    {
+      name: '📨 ST8 Rally 2',
+      value: buildGroupPlanFieldValue(
+        groups.find((g) => g.name === 'ST8 Rally 2') || { lastPlanRows: [] }
+      ),
+      inline: true,
+    },
+    {
+      name: '\u200b',
+      value: '\u200b',
+      inline: true,
+    },
+    {
+      name: '📨 ST2 Rally 1',
+      value: buildGroupPlanFieldValue(
+        groups.find((g) => g.name === 'ST2 Rally 1') || { lastPlanRows: [] }
+      ),
+      inline: true,
+    },
+    {
+      name: '📨 ST2 Rally 2',
+      value: buildGroupPlanFieldValue(
+        groups.find((g) => g.name === 'ST2 Rally 2') || { lastPlanRows: [] }
+      ),
+      inline: true,
+    },
+    {
+      name: '\u200b',
+      value: '\u200b',
+      inline: true,
+    }
+  );
+
+  return embed;
 }
 
 function buildDashboardRows() {
@@ -438,42 +466,6 @@ function buildDashboardRows() {
         .setCustomId('group:calculate')
         .setLabel('Calculate Launch Times')
         .setStyle(ButtonStyle.Primary)
-    ),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId('view:ST8 Rally 1')
-        .setLabel('ST8 Rally 1')
-        .setStyle(
-          uiState.selectedGroupName === 'ST8 Rally 1'
-            ? ButtonStyle.Primary
-            : ButtonStyle.Secondary
-        ),
-      new ButtonBuilder()
-        .setCustomId('view:ST8 Rally 2')
-        .setLabel('ST8 Rally 2')
-        .setStyle(
-          uiState.selectedGroupName === 'ST8 Rally 2'
-            ? ButtonStyle.Primary
-            : ButtonStyle.Secondary
-        )
-    ),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId('view:ST2 Rally 1')
-        .setLabel('ST2 Rally 1')
-        .setStyle(
-          uiState.selectedGroupName === 'ST2 Rally 1'
-            ? ButtonStyle.Primary
-            : ButtonStyle.Secondary
-        ),
-      new ButtonBuilder()
-        .setCustomId('view:ST2 Rally 2')
-        .setLabel('ST2 Rally 2')
-        .setStyle(
-          uiState.selectedGroupName === 'ST2 Rally 2'
-            ? ButtonStyle.Primary
-            : ButtonStyle.Secondary
-        )
     ),
   ];
 }
@@ -544,10 +536,11 @@ async function refreshDashboardMessage(force = false) {
     clearExpiredPlans();
 
     const channel = await getTextChannel();
-    const description = buildDashboardDescription();
+    const embed = buildDashboardEmbed();
     const nextHash = JSON.stringify({
-      description,
-      selectedGroupName: uiState.selectedGroupName,
+      title: embed.data.title,
+      description: embed.data.description,
+      fields: embed.data.fields,
       dashboardMessageId: uiState.dashboardMessageId,
     });
 
@@ -556,7 +549,7 @@ async function refreshDashboardMessage(force = false) {
     }
 
     const payload = {
-      embeds: [buildDashboardEmbed()],
+      embeds: [embed],
       components: buildDashboardRows(),
     };
 
@@ -597,12 +590,11 @@ client.once(Events.ClientReady, async () => {
       leadUserIds: [],
       lastArrivalTime: null,
       lastCalculatedAt: null,
-      lastPlanLines: [],
+      lastPlanRows: [],
     }))
   );
   ensureJsonFile(uiStatePath, {
     dashboardMessageId: null,
-    selectedGroupName: 'ST8 Rally 1',
   });
 
   leads = loadLeadsFromDisk();
@@ -621,18 +613,6 @@ client.once(Events.ClientReady, async () => {
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isButton()) {
-      if (interaction.customId.startsWith('view:')) {
-        await interaction.deferUpdate();
-        const groupName = interaction.customId.replace('view:', '');
-
-        if (GROUP_NAMES.includes(groupName)) {
-          uiState.selectedGroupName = groupName;
-          saveUiStateToDisk();
-          await refreshDashboardMessage(true);
-        }
-        return;
-      }
-
       if (interaction.customId === 'lead:register') {
         const modal = new ModalBuilder()
           .setCustomId('lead:register_modal')
@@ -898,13 +878,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         group.lastArrivalTime = arrivalTime.toISOString();
         group.lastCalculatedAt = new Date().toISOString();
-        group.lastPlanLines = buildPlanLinesForGroup(arrivalTime, groupLeads);
-
-        uiState.selectedGroupName = group.name;
+        group.lastPlanRows = buildPlanRowsForGroup(arrivalTime, groupLeads);
 
         saveGroupsToDisk();
-        saveUiStateToDisk();
-
         sessions.delete(interaction.user.id);
         await refreshDashboardMessage(true);
 
