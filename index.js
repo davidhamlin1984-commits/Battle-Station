@@ -340,6 +340,7 @@ function buildGroupPlanFieldValue(group) {
   }
 
   const now = Date.now();
+
   const visibleRows = group.lastPlanRows.filter((row) => {
     const callTime = new Date(row.callTime).getTime();
     return (
@@ -355,10 +356,15 @@ function buildGroupPlanFieldValue(group) {
   return visibleRows
     .map((row) => {
       const callDate = new Date(row.callTime);
-      const isCalled = now >= callDate.getTime();
-      const prefix = isCalled ? '🟨 ' : '';
-      const suffix = isCalled ? ' **CALL NOW**' : '';
-      return `${prefix}${row.gameName} - ${formatUtcTime(callDate)}${suffix}`;
+      const diff = callDate.getTime() - now;
+
+      // BEFORE send → countdown
+      if (diff > 0) {
+        return `${row.gameName} - ${formatUtcTime(callDate)} (${formatCountdownMs(diff)})`;
+      }
+
+      // EXACT send moment → SEND NOW
+      return `🟨 **SEND NOW** ${row.gameName} - ${formatUtcTime(callDate)}`;
     })
     .join('\n');
 }
