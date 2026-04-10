@@ -275,14 +275,11 @@ function clearExpiredPlans() {
       continue;
     }
 
-    const latestCall = Math.max(
-      ...group.lastPlanRows.map((row) => new Date(row.callTime).getTime())
-    );
+    const latestArrival = group.lastArrivalTime
+      ? new Date(group.lastArrivalTime).getTime()
+      : NaN;
 
-    if (
-      Number.isFinite(latestCall) &&
-      now > latestCall + PLAN_HIGHLIGHT_SECONDS * 1000
-    ) {
+    if (Number.isFinite(latestArrival) && now > latestArrival + PLAN_HIGHLIGHT_SECONDS * 1000) {
       group.lastArrivalTime = null;
       group.lastCalculatedAt = null;
       group.lastPlanRows = [];
