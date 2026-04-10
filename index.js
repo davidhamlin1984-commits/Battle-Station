@@ -113,12 +113,26 @@ function hasManagerAccess(member) {
   );
 }
 
-function makeDiscordTimestamp(date) {
-  return `<t:${Math.floor(date.getTime() / 1000)}:T>`;
+function formatUtcTime(date) {
+  const hh = String(date.getUTCHours()).padStart(2, '0');
+  const mm = String(date.getUTCMinutes()).padStart(2, '0');
+  const ss = String(date.getUTCSeconds()).padStart(2, '0');
+  return `${hh}:${mm}:${ss} UTC`;
 }
 
-function makeDiscordFullTimestamp(date) {
-  return `<t:${Math.floor(date.getTime() / 1000)}:F>`;
+function roundUpToNext15Seconds(date) {
+  const rounded = new Date(date.getTime());
+  rounded.setUTCMilliseconds(0);
+
+  const seconds = rounded.getUTCSeconds();
+  const remainder = seconds % 15;
+
+  if (remainder === 0) {
+    return rounded;
+  }
+
+  rounded.setUTCSeconds(seconds + (15 - remainder));
+  return rounded;
 }
 
 function upsertLead({ userId, discordName, gameName, rallySeconds }) {
@@ -307,37 +321,22 @@ function buildLaunchPlanFromOffsetEmbed(
   arrivalTime,
   leads
 ) {
-  const maxRallySeconds = Math.max(...leads.map((lead) => lead.rallySeconds));
-
   const lines = leads
     .map((lead) => {
       const launchTime = new Date(
         arrivalTime.getTime() - lead.rallySeconds * 1000
       );
-      const secondsFromNow = Math.max(
-        0,
-        Math.round((launchTime.getTime() - Date.now()) / 1000)
-      );
-
-      const marker =
-        lead.rallySeconds === maxRallySeconds
-          ? `Longest rally starts in **${offsetSeconds}s**`
-          : `Starts in **${secondsFromNow}s**`;
-
-      return [
-        `**${lead.gameName}** - ${lead.rallySeconds}s - <@${lead.userId}>`,
-        `${marker}`,
-        `Launch: ${makeDiscordTimestamp(launchTime)} (${makeDiscordFullTimestamp(launchTime)})`,
-      ].join('\n');
+      return `${lead.gameName} - ${formatUtcTime(launchTime)}`;
     })
-    .join('\n\n');
+    .join('\n');
 
   return new EmbedBuilder()
     .setTitle(`${groupName} Launch Plan`)
     .setDescription(
       [
-        `**Longest rally launch offset:** **${offsetSeconds}s from now**`,
-        `**Target Arrival:** ${makeDiscordTimestamp(arrivalTime)} (${makeDiscordFullTimestamp(arrivalTime)})`,
+        `Longest rally starts in **${offsetSeconds}s**`,
+        `Longest launch: ${formatUtcTime(longestLaunchTime)}`,
+        `Arrival: ${formatUtcTime(arrivalTime)}`,
         '',
         lines,
       ].join('\n')
@@ -564,8 +563,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const maxRallySeconds = Math.max(
           ...groupLeads.map((lead) => lead.rallySeconds)
         );
+
         const now = new Date();
-        const longestLaunchTime = new Date(now.getTime() + offsetSeconds * 1000);
+        const rawLongestLaunchTime = new Date(
+          now.getTime() + offsetSeconds * 1000
+        );
+
+        const longestLaunchTime = roundUpToNext15Seconds(rawLongestLaunchTime);
+
         const arrivalTime = new Date(
           longestLaunchTime.getTime() + maxRallySeconds * 1000
         );
