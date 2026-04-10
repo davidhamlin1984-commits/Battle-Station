@@ -398,26 +398,14 @@ function buildDashboardDescription() {
 
       let suffix = '';
 
-      const visibleRows = Array.isArray(group.lastPlanRows)
-        ? group.lastPlanRows.filter((row) => {
-            const callTime = new Date(row.callTime).getTime();
-            return (
-              Number.isFinite(callTime) &&
-              now <= callTime + PLAN_HIGHLIGHT_SECONDS * 1000
-            );
-          })
-        : [];
-
-      if (group.lastArrivalTime && visibleRows.length > 0) {
+      if (group.lastArrivalTime) {
         const landDate = new Date(group.lastArrivalTime);
 
         if (!Number.isNaN(landDate.getTime())) {
           const landDiff = landDate.getTime() - now;
 
           if (landDiff > 0) {
-            suffix = ` — 🎯 ${formatUtcTime(
-              landDate
-            )} — ${formatCountdownMs(landDiff)}`;
+            suffix = ` — 🎯 ${formatUtcTime(landDate)} — ${formatCountdownMs(landDiff)}`;
           } else {
             suffix = ` — 🎯 ${formatUtcTime(landDate)} — LANDED`;
           }
@@ -436,6 +424,7 @@ function buildDashboardDescription() {
     groupText,
   ].join('\n');
 }
+
 function buildDashboardEmbed() {
   const embed = new EmbedBuilder()
     .setTitle('SvS Command Dashboard')
