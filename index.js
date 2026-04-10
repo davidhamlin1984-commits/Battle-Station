@@ -38,6 +38,7 @@ const sessions = new Map();
 
 const leadsPath = path.join(DATA_DIR, 'rally_leads.json');
 const groupsPath = path.join(DATA_DIR, 'rally_groups.json');
+const dashboardStatePath = path.join(DATA_DIR, 'dashboard_state.json');
 
 const GROUP_NAMES = [
   'ST8 Rally 1',
@@ -45,6 +46,12 @@ const GROUP_NAMES = [
   'ST2 Rally 1',
   'ST2 Rally 2',
 ];
+
+let leads = [];
+let groups = [];
+let dashboardMessageId = null;
+let refreshInFlight = false;
+let lastDashboardHash = '';
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -74,15 +81,15 @@ function writeJson(filePath, value) {
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2), 'utf8');
 }
 
-function loadLeads() {
+function loadLeadsFromDisk() {
   return readJson(leadsPath, []);
 }
 
-function saveLeads(leads) {
+function saveLeadsToDisk() {
   writeJson(leadsPath, leads);
 }
 
-function loadGroups() {
+function loadGroupsFromDisk() {
   const defaultGroups = GROUP_NAMES.map((name) => ({
     name,
     leadUserIds: [],
@@ -90,13 +97,13 @@ function loadGroups() {
     lastCalculatedAt: null,
   }));
 
-  const groups = readJson(groupsPath, defaultGroups);
-  const existingNames = new Set(groups.map((g) => g.name));
+  const loaded = readJson(groupsPath, defaultGroups);
+  const existingNames = new Set(loaded.map((g) => g.name));
   let changed = false;
 
   for (const groupName of GROUP_NAMES) {
     if (!existingNames.has(groupName)) {
-      groups.push({
+      loaded.push({
         name: groupName,
         leadUserIds: [],
         lastArrivalTime: null,
@@ -106,7 +113,7 @@ function loadGroups() {
     }
   }
 
-  for (const group of groups) {
+  for (const group of loaded) {
     if (!Object.prototype.hasOwnProperty.call(group, 'lastArrivalTime')) {
       group.lastArrivalTime = null;
       changed = true;
@@ -117,12 +124,24 @@ function loadGroups() {
     }
   }
 
-  if (changed) saveGroups(groups);
-  return groups;
+  if (changed) {
+    writeJson(groupsPath, loaded);
+  }
+
+  return loaded;
 }
 
-function saveGroups(groups) {
+function saveGroupsToDisk() {
   writeJson(groupsPath, groups);
+}
+
+function loadDashboardState() {
+  const state = readJson(dashboardStatePath, { dashboardMessageId: null });
+  dashboardMessageId = state.dashboardMessageId || null;
+}
+
+function saveDashboardState() {
+  writeJson(dashboardStatePath, { dashboardMessageId });
 }
 
 function hasManagerAccess(member) {
@@ -172,8 +191,7 @@ function getTotalTravelSeconds(lead) {
   return 300 + Number(lead.rallySeconds || 0);
 }
 
-function upsertLead({ userId, discordName, gameName, rallySeconds }) {
-  const leads = loadLeads();
+function upsertLeadInMemory({ userId, discordName, gameName, rallySeconds }) {
   const existing = leads.find((l) => l.userId === userId);
 
   if (existing) {
@@ -192,12 +210,10 @@ function upsertLead({ userId, discordName, gameName, rallySeconds }) {
     });
   }
 
-  saveLeads(leads);
+  saveLeadsToDisk();
 }
 
-function buildDashboardEmbed() {
-  const leads = loadLeads();
-  const groups = loadGroups();
+function buildDashboardDescription() {
   const now = Date.now();
 
   const leadText =
@@ -239,17 +255,13 @@ function buildDashboardEmbed() {
     })
     .join('\n');
 
+  return [`**Rally Leads**`, leadText, '', `**Groups**`, groupText].join('\n');
+}
+
+function buildDashboardEmbed() {
   return new EmbedBuilder()
     .setTitle('SvS Rally Lead Dashboard')
-    .setDescription(
-      [
-        `**Rally Leads**`,
-        leadText,
-        '',
-        `**Groups**`,
-        groupText,
-      ].join('\n')
-    );
+    .setDescription(buildDashboardDescription());
 }
 
 function buildDashboardRows() {
@@ -292,8 +304,6 @@ function buildGroupSelect(customId) {
 }
 
 function buildLeadSelect(customId) {
-  const leads = loadLeads();
-
   if (leads.length === 0) {
     return null;
   }
@@ -326,52 +336,14 @@ function buildLaunchOffsetSelect() {
   );
 }
 
-async function refreshDashboardMessage() {
-  try {
-    const channel = await client.channels.fetch(SVS_CHANNEL_ID);
-
-    if (!channel || !channel.isTextBased()) {
-      console.error('SVS channel is not text-based or not found.');
-      return;
-    }
-
-    const payload = {
-      embeds: [buildDashboardEmbed()],
-      components: buildDashboardRows(),
-    };
-
-    let existing = null;
-
-    try {
-      const recent = await channel.messages.fetch({ limit: 20 });
-      existing = recent.find(
-        (m) =>
-          m.author.id === client.user.id &&
-          m.embeds.length > 0 &&
-          m.embeds[0].title === 'SvS Rally Lead Dashboard'
-      );
-    } catch (error) {
-      console.warn('Could not read recent messages, sending a new dashboard.');
-    }
-
-    if (existing) {
-      await existing.edit(payload);
-    } else {
-      await channel.send(payload);
-    }
-  } catch (error) {
-    console.error('Failed to refresh dashboard message', error);
-  }
-}
-
 function buildLaunchPlanFromOffsetEmbed(
   groupName,
   offsetSeconds,
   longestLaunchTime,
   arrivalTime,
-  leads
+  selectedLeads
 ) {
-  const lines = leads
+  const lines = selectedLeads
     .map((lead) => {
       const launchTime = new Date(
         arrivalTime.getTime() - getTotalTravelSeconds(lead) * 1000
@@ -400,8 +372,63 @@ function buildLaunchPlanFromOffsetEmbed(
     );
 }
 
+async function refreshDashboardMessage(force = false) {
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+
+  try {
+    const channel = await client.channels.fetch(SVS_CHANNEL_ID);
+
+    if (!channel || !channel.isTextBased()) {
+      console.error('SVS channel is not text-based or not found.');
+      return;
+    }
+
+    const description = buildDashboardDescription();
+    const nextHash = JSON.stringify({
+      description,
+      rows: 2,
+      dashboardMessageId,
+    });
+
+    if (!force && dashboardMessageId && nextHash === lastDashboardHash) {
+      return;
+    }
+
+    const payload = {
+      embeds: [new EmbedBuilder().setTitle('SvS Rally Lead Dashboard').setDescription(description)],
+      components: buildDashboardRows(),
+    };
+
+    let msg = null;
+
+    if (dashboardMessageId) {
+      try {
+        msg = await channel.messages.fetch(dashboardMessageId);
+      } catch (error) {
+        msg = null;
+      }
+    }
+
+    if (msg) {
+      await msg.edit(payload);
+    } else {
+      const sent = await channel.send(payload);
+      dashboardMessageId = sent.id;
+      saveDashboardState();
+    }
+
+    lastDashboardHash = nextHash;
+  } catch (error) {
+    console.error('Failed to refresh dashboard message', error);
+  } finally {
+    refreshInFlight = false;
+  }
+}
+
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
   ensureJsonFile(leadsPath, []);
   ensureJsonFile(
     groupsPath,
@@ -412,14 +439,19 @@ client.once(Events.ClientReady, async () => {
       lastCalculatedAt: null,
     }))
   );
+  ensureJsonFile(dashboardStatePath, { dashboardMessageId: null });
 
-  await refreshDashboardMessage();
+  leads = loadLeadsFromDisk();
+  groups = loadGroupsFromDisk();
+  loadDashboardState();
+
+  await refreshDashboardMessage(true);
 
   setInterval(() => {
-    refreshDashboardMessage().catch((error) =>
+    refreshDashboardMessage(false).catch((error) =>
       console.error('Failed to refresh dashboard on interval', error)
     );
-  }, 5000);
+  }, 1000);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -455,7 +487,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (interaction.customId === 'dashboard:refresh') {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        await refreshDashboardMessage();
+        await refreshDashboardMessage(true);
         await interaction.editReply({
           content: 'Dashboard refreshed.',
         });
@@ -550,8 +582,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const groups = loadGroups();
-
         for (const group of groups) {
           group.leadUserIds = group.leadUserIds.filter((id) => id !== userId);
         }
@@ -569,11 +599,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           targetGroup.leadUserIds.push(userId);
         }
 
-        saveGroups(groups);
+        saveGroupsToDisk();
         sessions.delete(interaction.user.id);
-        await refreshDashboardMessage();
+        await refreshDashboardMessage(true);
 
-        const leads = loadLeads();
         const lead = leads.find((l) => l.userId === userId);
 
         await interaction.followUp({
@@ -609,8 +638,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         const offsetSeconds = Number(interaction.values[0]);
-        const groups = loadGroups();
-        const leads = loadLeads();
         const group = groups.find((g) => g.name === session.groupName);
 
         if (!group) {
@@ -650,7 +677,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         group.lastArrivalTime = arrivalTime.toISOString();
         group.lastCalculatedAt = new Date().toISOString();
-        saveGroups(groups);
+        saveGroupsToDisk();
 
         const channel = await client.channels.fetch(SVS_CHANNEL_ID);
         if (!channel || !channel.isTextBased()) {
@@ -674,7 +701,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
 
         sessions.delete(interaction.user.id);
-        await refreshDashboardMessage();
+        await refreshDashboardMessage(true);
 
         await interaction.followUp({
           content: `Launch plan posted for **${group.name}**.`,
@@ -707,14 +734,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        upsertLead({
+        upsertLeadInMemory({
           userId: interaction.user.id,
           discordName: interaction.member?.displayName || interaction.user.username,
           gameName,
           rallySeconds,
         });
 
-        await refreshDashboardMessage();
+        await refreshDashboardMessage(true);
 
         await interaction.editReply({
           content: `Registered **${gameName}** with rally time **${rallySeconds}s**.`,
