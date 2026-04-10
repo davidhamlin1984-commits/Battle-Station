@@ -402,9 +402,9 @@ function buildDashboardDescription() {
           const landDiff = landDate.getTime() - now;
 
           if (landDiff > 0) {
-            suffix = ` — 🎯 ${formatUtcTime(landDate)} — ${formatCountdownMs(landDiff)}`;
+            suffix = ` —  ${formatUtcTime(landDate)} — ${formatCountdownMs(landDiff)}`;
           } else {
-            suffix = ` — 🎯 ${formatUtcTime(landDate)} — LANDED`;
+            suffix = ` —  ${formatUtcTime(landDate)} — LANDED`;
           }
         }
       }
@@ -414,10 +414,10 @@ function buildDashboardDescription() {
     .join('\n');
 
   return [
-    '**👤 Rally Leads**',
+    '**Rally Leads**',
     leadText,
     '',
-    '**🧩 Groups**',
+    '**Groups**',
     groupText,
   ].join('\n');
 }
@@ -429,14 +429,14 @@ function buildDashboardEmbed() {
 
   embed.addFields(
     {
-      name: '📨 ST8 Rally 1',
+      name: 'ST8 Rally 1',
       value: buildGroupPlanFieldValue(
         groups.find((g) => g.name === 'ST8 Rally 1') || { lastPlanRows: [] }
       ),
       inline: true,
     },
     {
-      name: '📨 ST8 Rally 2',
+      name: 'ST8 Rally 2',
       value: buildGroupPlanFieldValue(
         groups.find((g) => g.name === 'ST8 Rally 2') || { lastPlanRows: [] }
       ),
@@ -448,14 +448,14 @@ function buildDashboardEmbed() {
       inline: true,
     },
     {
-      name: '📨 ST2 Rally 1',
+      name: 'ST2 Rally 1',
       value: buildGroupPlanFieldValue(
         groups.find((g) => g.name === 'ST2 Rally 1') || { lastPlanRows: [] }
       ),
       inline: true,
     },
     {
-      name: '📨 ST2 Rally 2',
+      name: 'ST2 Rally 2',
       value: buildGroupPlanFieldValue(
         groups.find((g) => g.name === 'ST2 Rally 2') || { lastPlanRows: [] }
       ),
