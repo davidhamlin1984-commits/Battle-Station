@@ -25,6 +25,7 @@ const RALLY_MANAGER_ROLE_NAME =
   process.env.RALLY_MANAGER_ROLE_NAME || 'Rally Lead';
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 
+// How long a send-time stays visible after its call time passes
 const PLAN_HIGHLIGHT_SECONDS = 8;
 
 if (!TOKEN || !SVS_CHANNEL_ID) {
@@ -390,14 +391,13 @@ function buildDashboardDescription() {
               .join(', ');
 
       let suffix = '';
-
       if (group.lastArrivalTime) {
         const landDate = new Date(group.lastArrivalTime);
-        const landTime = landDate.getTime();
-
-        if (!Number.isNaN(landTime) && landTime > now) {
-          suffix = ` — 🎯 ${formatUtcTime(landDate)} — ${formatCountdownToDate(landDate)}`;
-        } else if (!Number.isNaN(landTime)) {
+        if (!Number.isNaN(landDate.getTime()) && landDate.getTime() > now) {
+          suffix = ` — 🎯 ${formatUtcTime(
+            landDate
+          )} — ${formatCountdownToDate(landDate)}`;
+        } else if (!Number.isNaN(landDate.getTime())) {
           suffix = ` — 🎯 ${formatUtcTime(landDate)} — 00:00`;
         }
       }
@@ -622,6 +622,27 @@ async function refreshDashboardMessage(force = false) {
   }
 }
 
+async function closeEphemeralFlow(interaction) {
+  try {
+    if (interaction.isStringSelectMenu()) {
+      await interaction.update({
+        content: 'Done.',
+        components: [],
+      }).catch(() => null);
+      setTimeout(() => {
+        interaction.deleteReply().catch(() => null);
+      }, 300);
+      return;
+    }
+
+    if (interaction.deferred || interaction.replied) {
+      await interaction.deleteReply().catch(() => null);
+    }
+  } catch (error) {
+    // ignore
+  }
+}
+
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
@@ -810,6 +831,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
             content: 'No rally leads are registered yet.',
             components: [],
           });
+          setTimeout(() => {
+            interaction.deleteReply().catch(() => null);
+          }, 300);
           return;
         }
 
@@ -821,12 +845,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (interaction.customId === 'group:assign_select_lead') {
-        await interaction.deferUpdate();
-
         const selectedLeadId = interaction.values[0];
         const session = sessions.get(interaction.user.id);
 
         if (!session?.groupName) {
+          await interaction.update({
+            content: 'Session expired.',
+            components: [],
+          }).catch(() => null);
+          setTimeout(() => {
+            interaction.deleteReply().catch(() => null);
+          }, 300);
           return;
         }
 
@@ -838,6 +867,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const targetGroup = groups.find((g) => g.name === session.groupName);
         if (!targetGroup) {
+          await interaction.update({
+            content: 'Group not found.',
+            components: [],
+          }).catch(() => null);
+          setTimeout(() => {
+            interaction.deleteReply().catch(() => null);
+          }, 300);
           return;
         }
 
@@ -848,6 +884,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         saveGroupsToDisk();
         sessions.delete(interaction.user.id);
         await refreshDashboardMessage(true);
+        await closeEphemeralFlow(interaction);
         return;
       }
 
@@ -865,10 +902,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (interaction.customId === 'group:calculate_select_offset') {
-        await interaction.deferUpdate();
-
         const session = sessions.get(interaction.user.id);
         if (!session?.groupName) {
+          await interaction.update({
+            content: 'Session expired.',
+            components: [],
+          }).catch(() => null);
+          setTimeout(() => {
+            interaction.deleteReply().catch(() => null);
+          }, 300);
           return;
         }
 
@@ -876,6 +918,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const group = groups.find((g) => g.name === session.groupName);
 
         if (!group) {
+          await interaction.update({
+            content: 'Group not found.',
+            components: [],
+          }).catch(() => null);
+          setTimeout(() => {
+            interaction.deleteReply().catch(() => null);
+          }, 300);
           return;
         }
 
@@ -884,6 +933,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .filter(Boolean);
 
         if (groupLeads.length === 0) {
+          await interaction.update({
+            content: 'That group has no rally leads assigned.',
+            components: [],
+          }).catch(() => null);
+          setTimeout(() => {
+            interaction.deleteReply().catch(() => null);
+          }, 300);
           return;
         }
 
@@ -908,6 +964,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         saveGroupsToDisk();
         sessions.delete(interaction.user.id);
         await refreshDashboardMessage(true);
+        await closeEphemeralFlow(interaction);
         return;
       }
     }
