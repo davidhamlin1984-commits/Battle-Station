@@ -671,7 +671,7 @@ client.once(Events.ClientReady, async () => {
     refreshDashboardMessage(false).catch((error) =>
       console.error('Failed to refresh dashboard on interval', error)
     );
-  }, 1000);
+  }, 500);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
