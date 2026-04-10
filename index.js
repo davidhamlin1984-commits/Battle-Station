@@ -390,13 +390,14 @@ function buildDashboardDescription() {
               .join(', ');
 
       let suffix = '';
+
       if (group.lastArrivalTime) {
         const landDate = new Date(group.lastArrivalTime);
-        if (!Number.isNaN(landDate.getTime()) && landDate.getTime() > now) {
-          suffix = ` — 🎯 ${formatUtcTime(
-            landDate
-          )} — ${formatCountdownToDate(landDate)}`;
-        } else if (!Number.isNaN(landDate.getTime())) {
+        const landTime = landDate.getTime();
+
+        if (!Number.isNaN(landTime) && landTime > now) {
+          suffix = ` — 🎯 ${formatUtcTime(landDate)} — ${formatCountdownToDate(landDate)}`;
+        } else if (!Number.isNaN(landTime)) {
           suffix = ` — 🎯 ${formatUtcTime(landDate)} — 00:00`;
         }
       }
