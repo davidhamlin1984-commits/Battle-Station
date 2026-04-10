@@ -86,15 +86,33 @@ function loadGroups() {
   const defaultGroups = GROUP_NAMES.map((name) => ({
     name,
     leadUserIds: [],
+    lastArrivalTime: null,
+    lastCalculatedAt: null,
   }));
-  const groups = readJson(groupsPath, defaultGroups);
 
+  const groups = readJson(groupsPath, defaultGroups);
   const existingNames = new Set(groups.map((g) => g.name));
   let changed = false;
 
   for (const groupName of GROUP_NAMES) {
     if (!existingNames.has(groupName)) {
-      groups.push({ name: groupName, leadUserIds: [] });
+      groups.push({
+        name: groupName,
+        leadUserIds: [],
+        lastArrivalTime: null,
+        lastCalculatedAt: null,
+      });
+      changed = true;
+    }
+  }
+
+  for (const group of groups) {
+    if (!Object.prototype.hasOwnProperty.call(group, 'lastArrivalTime')) {
+      group.lastArrivalTime = null;
+      changed = true;
+    }
+    if (!Object.prototype.hasOwnProperty.call(group, 'lastCalculatedAt')) {
+      group.lastCalculatedAt = null;
       changed = true;
     }
   }
@@ -120,6 +138,21 @@ function formatUtcTime(date) {
   return `${hh}:${mm}:${ss} UTC`;
 }
 
+function formatCountdownMs(ms) {
+  const safeMs = Math.max(0, ms);
+  const totalSeconds = Math.ceil(safeMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(
+    2,
+    '0'
+  )}`;
+}
+
+function formatCountdownToDate(date) {
+  return formatCountdownMs(date.getTime() - Date.now());
+}
+
 function roundUpToNext15Seconds(date) {
   const rounded = new Date(date.getTime());
   rounded.setUTCMilliseconds(0);
@@ -133,6 +166,10 @@ function roundUpToNext15Seconds(date) {
 
   rounded.setUTCSeconds(seconds + (15 - remainder));
   return rounded;
+}
+
+function getTotalTravelSeconds(lead) {
+  return 300 + Number(lead.rallySeconds || 0);
 }
 
 function upsertLead({ userId, discordName, gameName, rallySeconds }) {
@@ -161,6 +198,7 @@ function upsertLead({ userId, discordName, gameName, rallySeconds }) {
 function buildDashboardEmbed() {
   const leads = loadLeads();
   const groups = loadGroups();
+  const now = Date.now();
 
   const leadText =
     leads.length === 0
@@ -185,7 +223,19 @@ function buildDashboardEmbed() {
               })
               .join(', ');
 
-      return `**${group.name}**: ${members}`;
+      let suffix = '';
+      if (group.lastArrivalTime) {
+        const landDate = new Date(group.lastArrivalTime);
+        if (!Number.isNaN(landDate.getTime()) && landDate.getTime() > now) {
+          suffix = ` | Land: ${formatUtcTime(
+            landDate
+          )} | ${formatCountdownToDate(landDate)}`;
+        } else if (!Number.isNaN(landDate.getTime())) {
+          suffix = ` | Land: ${formatUtcTime(landDate)} | 00:00`;
+        }
+      }
+
+      return `**${group.name}**: ${members}${suffix}`;
     })
     .join('\n');
 
@@ -324,9 +374,12 @@ function buildLaunchPlanFromOffsetEmbed(
   const lines = leads
     .map((lead) => {
       const launchTime = new Date(
-        arrivalTime.getTime() - lead.rallySeconds * 1000
+        arrivalTime.getTime() - getTotalTravelSeconds(lead) * 1000
       );
-      return `${lead.gameName} - ${formatUtcTime(launchTime)}`;
+
+      return `${lead.gameName} - ${formatUtcTime(launchTime)} (${formatCountdownToDate(
+        launchTime
+      )})`;
     })
     .join('\n');
 
@@ -334,7 +387,13 @@ function buildLaunchPlanFromOffsetEmbed(
     .setTitle(`${groupName} Launch Plan`)
     .setDescription(
       [
-
+        `Longest rally starts in **${offsetSeconds}s**`,
+        `Longest launch: ${formatUtcTime(longestLaunchTime)} (${formatCountdownToDate(
+          longestLaunchTime
+        )})`,
+        `Land time: ${formatUtcTime(arrivalTime)} (${formatCountdownToDate(
+          arrivalTime
+        )})`,
         '',
         lines,
       ].join('\n')
@@ -346,9 +405,21 @@ client.once(Events.ClientReady, async () => {
   ensureJsonFile(leadsPath, []);
   ensureJsonFile(
     groupsPath,
-    GROUP_NAMES.map((name) => ({ name, leadUserIds: [] }))
+    GROUP_NAMES.map((name) => ({
+      name,
+      leadUserIds: [],
+      lastArrivalTime: null,
+      lastCalculatedAt: null,
+    }))
   );
+
   await refreshDashboardMessage();
+
+  setInterval(() => {
+    refreshDashboardMessage().catch((error) =>
+      console.error('Failed to refresh dashboard on interval', error)
+    );
+  }, 5000);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -558,8 +629,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const maxRallySeconds = Math.max(
-          ...groupLeads.map((lead) => lead.rallySeconds)
+        const maxTravelSeconds = Math.max(
+          ...groupLeads.map((lead) => getTotalTravelSeconds(lead))
         );
 
         const now = new Date();
@@ -570,8 +641,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const longestLaunchTime = roundUpToNext15Seconds(rawLongestLaunchTime);
 
         const arrivalTime = new Date(
-          longestLaunchTime.getTime() + maxRallySeconds * 1000
+          longestLaunchTime.getTime() + maxTravelSeconds * 1000
         );
+
+        group.lastArrivalTime = arrivalTime.toISOString();
+        group.lastCalculatedAt = new Date().toISOString();
+        saveGroups(groups);
 
         const channel = await client.channels.fetch(SVS_CHANNEL_ID);
         if (!channel || !channel.isTextBased()) {
@@ -595,6 +670,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
 
         sessions.delete(interaction.user.id);
+        await refreshDashboardMessage();
 
         await interaction.update({
           content: `Launch plan posted for **${group.name}**.`,
