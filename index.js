@@ -9,15 +9,20 @@ const {
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  ModalBuilder,
   StringSelectMenuBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   MessageFlags,
+  InteractionType,
 } = require('discord.js');
 
 dotenv.config();
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const SVS_CHANNEL_ID = process.env.SVS_CHANNEL_ID;
-const RALLY_ROLE_NAME = process.env.RALLY_LEAD_ROLE_NAME || 'Rally Lead';
+const RALLY_MANAGER_ROLE_NAME =
+  process.env.RALLY_MANAGER_ROLE_NAME || 'Rally Lead';
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 
 if (!TOKEN || !SVS_CHANNEL_ID) {
@@ -30,7 +35,16 @@ const client = new Client({
 });
 
 const sessions = new Map();
-const ralliesPath = path.join(DATA_DIR, 'svs_rallies.json');
+
+const leadsPath = path.join(DATA_DIR, 'rally_leads.json');
+const groupsPath = path.join(DATA_DIR, 'rally_groups.json');
+
+const GROUP_NAMES = [
+  'ST8 Rally 1',
+  'ST8 Rally 2',
+  'ST2 Rally 1',
+  'ST2 Rally 2',
+];
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -38,190 +52,231 @@ function ensureDataDir() {
   }
 }
 
-function ensureJsonFile(filePath) {
+function ensureJsonFile(filePath, defaultValue) {
   ensureDataDir();
   if (!fs.existsSync(filePath)) {
-    fs.writeFileSync(filePath, '[]', 'utf8');
+    fs.writeFileSync(filePath, JSON.stringify(defaultValue, null, 2), 'utf8');
   }
 }
 
-function loadRallies() {
-  ensureJsonFile(ralliesPath);
+function readJson(filePath, fallback) {
   try {
-    return JSON.parse(fs.readFileSync(ralliesPath, 'utf8'));
+    ensureJsonFile(filePath, fallback);
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
   } catch (error) {
-    console.error('Failed to read svs_rallies.json', error);
-    return [];
+    console.error(`Failed to read ${filePath}`, error);
+    return fallback;
   }
 }
 
-function saveRallies(rallies) {
-  ensureJsonFile(ralliesPath);
-  fs.writeFileSync(ralliesPath, JSON.stringify(rallies, null, 2), 'utf8');
+function writeJson(filePath, value) {
+  ensureJsonFile(filePath, value);
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), 'utf8');
 }
 
-function hasAccess(member) {
-  return member?.roles?.cache?.some((r) => r.name === RALLY_ROLE_NAME);
+function loadLeads() {
+  return readJson(leadsPath, []);
 }
 
-function makeId() {
-  return `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+function saveLeads(leads) {
+  writeJson(leadsPath, leads);
 }
 
-function createTeams() {
-  return {
-    'ST8-1': [],
-    'ST8-2': [],
-    'ST2-1': [],
-    'ST2-2': [],
-  };
-}
+function loadGroups() {
+  const defaultGroups = GROUP_NAMES.map((name) => ({
+    name,
+    leadUserIds: [],
+  }));
+  const groups = readJson(groupsPath, defaultGroups);
 
-function activeRallies() {
-  const now = Date.now();
-  const rallies = loadRallies();
+  const existingNames = new Set(groups.map((g) => g.name));
   let changed = false;
 
-  for (const rally of rallies) {
-    if (rally.active && rally.time <= now) {
-      rally.active = false;
+  for (const groupName of GROUP_NAMES) {
+    if (!existingNames.has(groupName)) {
+      groups.push({ name: groupName, leadUserIds: [] });
       changed = true;
     }
   }
 
-  if (changed) {
-    saveRallies(rallies);
+  if (changed) saveGroups(groups);
+  return groups;
+}
+
+function saveGroups(groups) {
+  writeJson(groupsPath, groups);
+}
+
+function hasManagerAccess(member) {
+  return member?.roles?.cache?.some(
+    (role) => role.name === RALLY_MANAGER_ROLE_NAME
+  );
+}
+
+function makeDiscordTimestamp(date) {
+  return `<t:${Math.floor(date.getTime() / 1000)}:T>`;
+}
+
+function makeDiscordFullTimestamp(date) {
+  return `<t:${Math.floor(date.getTime() / 1000)}:F>`;
+}
+
+function parseUtcTimeOnly(input) {
+  const trimmed = (input || '').trim();
+  const match = trimmed.match(/^(\d{2}):(\d{2}):(\d{2})$/);
+  if (!match) return null;
+
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  const second = Number(match[3]);
+
+  if (
+    hour < 0 || hour > 23 ||
+    minute < 0 || minute > 59 ||
+    second < 0 || second > 59
+  ) {
+    return null;
   }
 
-  return rallies.filter((r) => r.active);
+  const now = new Date();
+  const target = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    hour,
+    minute,
+    second,
+    0
+  ));
+
+  return target;
+}
+
+function upsertLead({ userId, discordName, gameName, rallySeconds }) {
+  const leads = loadLeads();
+  const existing = leads.find((l) => l.userId === userId);
+
+  if (existing) {
+    existing.discordName = discordName;
+    existing.gameName = gameName;
+    existing.rallySeconds = rallySeconds;
+    existing.updatedAt = new Date().toISOString();
+  } else {
+    leads.push({
+      userId,
+      discordName,
+      gameName,
+      rallySeconds,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  saveLeads(leads);
 }
 
 function buildDashboardEmbed() {
-  const rallies = activeRallies();
+  const leads = loadLeads();
+  const groups = loadGroups();
 
-  const description =
-    rallies.length === 0
-      ? 'No active SvS rallies right now.'
-      : rallies
-          .slice(0, 10)
-          .map((r, i) => {
-            const teamCounts = Object.entries(r.teams)
-              .map(([name, users]) => `${name}: ${users.length}`)
-              .join(' | ');
+  const leadText =
+    leads.length === 0
+      ? 'No rally leads registered yet.'
+      : leads
+          .slice(0, 15)
+          .map(
+            (lead, i) =>
+              `**${i + 1}. ${lead.gameName}** - ${lead.rallySeconds}s - <@${lead.userId}>`
+          )
+          .join('\n');
 
-            return [
-              `**${i + 1}. ${r.type} - ${r.alliance}**`,
-              `Starts: <t:${Math.floor(r.time / 1000)}:R>`,
-              `Teams: ${teamCounts}`,
-            ].join('\n');
-          })
-          .join('\n\n');
+  const groupText = groups
+    .map((group) => {
+      const members =
+        group.leadUserIds.length === 0
+          ? 'None'
+          : group.leadUserIds
+              .map((id) => {
+                const lead = leads.find((l) => l.userId === id);
+                return lead ? `${lead.gameName}` : `<@${id}>`;
+              })
+              .join(', ');
+
+      return `**${group.name}**: ${members}`;
+    })
+    .join('\n');
 
   return new EmbedBuilder()
-    .setTitle('SvS Rally Dashboard')
-    .setDescription(description);
+    .setTitle('SvS Rally Lead Dashboard')
+    .setDescription(
+      [
+        `**Rally Leads**`,
+        leadText,
+        '',
+        `**Groups**`,
+        groupText,
+      ].join('\n')
+    );
 }
 
 function buildDashboardRows() {
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
-        .setCustomId('dashboard:create_rally')
-        .setLabel('Create SvS Rally')
+        .setCustomId('lead:register')
+        .setLabel('Become Rally Lead')
         .setStyle(ButtonStyle.Primary),
-      new ButtonBuilder()
-        .setCustomId('dashboard:view_rallies')
-        .setLabel('View Active Rallies')
-        .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId('dashboard:refresh')
         .setLabel('Refresh Dashboard')
         .setStyle(ButtonStyle.Secondary)
     ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('group:assign')
+        .setLabel('Assign Lead To Group')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId('group:calculate')
+        .setLabel('Calculate Launch Times')
+        .setStyle(ButtonStyle.Primary)
+    ),
   ];
 }
 
-function buildAllianceSelect() {
+function buildGroupSelect(customId) {
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
-      .setCustomId('rally:alliance')
-      .setPlaceholder('Select alliance')
+      .setCustomId(customId)
+      .setPlaceholder('Select a group')
       .addOptions(
-        { label: 'ZRH', value: 'ZRH' },
-        { label: 'VIK', value: 'VIK' }
+        GROUP_NAMES.map((name) => ({
+          label: name,
+          value: name,
+        }))
       )
   );
 }
 
-function buildTypeSelect() {
+function buildLeadSelect(customId) {
+  const leads = loadLeads();
+
+  if (leads.length === 0) {
+    return null;
+  }
+
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
-      .setCustomId('rally:type')
-      .setPlaceholder('Select rally type')
+      .setCustomId(customId)
+      .setPlaceholder('Select a rally lead')
       .addOptions(
-        { label: 'Attack', value: 'ATTACK' },
-        { label: 'Defense', value: 'DEFENSE' }
+        leads.slice(0, 25).map((lead) => ({
+          label: `${lead.gameName} (${lead.rallySeconds}s)`.slice(0, 100),
+          value: lead.userId,
+          description: lead.discordName?.slice(0, 100) || `User ${lead.userId}`,
+        }))
       )
   );
-}
-
-function buildStartSelect() {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('rally:start')
-      .setPlaceholder('Start in...')
-      .addOptions(
-        { label: '15 seconds', value: '15' },
-        { label: '30 seconds', value: '30' },
-        { label: '45 seconds', value: '45' },
-        { label: '60 seconds', value: '60' }
-      )
-  );
-}
-
-function buildTeamButtons(id, disabled = false) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`team:${id}:ST8-1`)
-      .setLabel('ST8-1')
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(disabled),
-    new ButtonBuilder()
-      .setCustomId(`team:${id}:ST8-2`)
-      .setLabel('ST8-2')
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(disabled),
-    new ButtonBuilder()
-      .setCustomId(`team:${id}:ST2-1`)
-      .setLabel('ST2-1')
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(disabled),
-    new ButtonBuilder()
-      .setCustomId(`team:${id}:ST2-2`)
-      .setLabel('ST2-2')
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(disabled)
-  );
-}
-
-function buildRallyText(rally) {
-  const teamText = Object.entries(rally.teams)
-    .map(([name, users]) => {
-      const mentions = users.length
-        ? users.map((id) => `<@${id}>`).join(', ')
-        : '';
-      return `${name} (${users.length}): ${mentions}`;
-    })
-    .join('\n');
-
-  return [
-    `🔥 **SvS Rally - ${rally.type}**`,
-    `Alliance: **${rally.alliance}**`,
-    `Starts: <t:${Math.floor(rally.time / 1000)}:R>`,
-    '',
-    `**Teams:**`,
-    teamText,
-  ].join('\n');
 }
 
 async function refreshDashboardMessage() {
@@ -233,20 +288,24 @@ async function refreshDashboardMessage() {
       return;
     }
 
-    console.log('SVS channel type:', channel.type, 'textBased:', channel.isTextBased());
-
-    const recent = await channel.messages.fetch({ limit: 20 });
-    const existing = recent.find(
-      (m) =>
-        m.author.id === client.user.id &&
-        m.embeds.length > 0 &&
-        m.embeds[0].title === 'SvS Rally Dashboard'
-    );
-
     const payload = {
       embeds: [buildDashboardEmbed()],
       components: buildDashboardRows(),
     };
+
+    let existing = null;
+
+    try {
+      const recent = await channel.messages.fetch({ limit: 20 });
+      existing = recent.find(
+        (m) =>
+          m.author.id === client.user.id &&
+          m.embeds.length > 0 &&
+          m.embeds[0].title === 'SvS Rally Lead Dashboard'
+      );
+    } catch (error) {
+      console.warn('Could not read recent messages, sending a new dashboard.');
+    }
 
     if (existing) {
       await existing.edit(payload);
@@ -258,238 +317,332 @@ async function refreshDashboardMessage() {
   }
 }
 
-async function refreshRallyMessage(rally) {
-  try {
-    if (!rally.messageId) return;
+function buildLaunchPlanEmbed(groupName, arrivalTime, leads) {
+  const lines = leads
+    .map((lead) => {
+      const launchTime = new Date(arrivalTime.getTime() - lead.rallySeconds * 1000);
+      return [
+        `**${lead.gameName}** - ${lead.rallySeconds}s`,
+        `Launch: ${makeDiscordTimestamp(launchTime)} (${makeDiscordFullTimestamp(launchTime)})`,
+      ].join('\n');
+    })
+    .join('\n\n');
 
-    const channel = await client.channels.fetch(SVS_CHANNEL_ID);
-    if (!channel || !channel.isTextBased()) {
-      return;
-    }
-
-    const message = await channel.messages.fetch(rally.messageId);
-
-    await message.edit({
-      content: buildRallyText(rally),
-      components: [buildTeamButtons(rally.id, !rally.active)],
-    });
-  } catch (error) {
-    console.error('Failed to refresh rally message', error);
-  }
-}
-
-async function closeExpiredRallies() {
-  const rallies = loadRallies();
-  const now = Date.now();
-  let changed = false;
-
-  for (const rally of rallies) {
-    if (rally.active && rally.time <= now) {
-      rally.active = false;
-      changed = true;
-      await refreshRallyMessage(rally);
-    }
-  }
-
-  if (changed) {
-    saveRallies(rallies);
-    await refreshDashboardMessage();
-  }
+  return new EmbedBuilder()
+    .setTitle(`${groupName} Launch Plan`)
+    .setDescription(
+      [
+        `**Target Arrival:** ${makeDiscordTimestamp(arrivalTime)} (${makeDiscordFullTimestamp(arrivalTime)})`,
+        '',
+        lines || 'No leads assigned.',
+      ].join('\n')
+    );
 }
 
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
-  ensureJsonFile(ralliesPath);
+  ensureJsonFile(leadsPath, []);
+  ensureJsonFile(
+    groupsPath,
+    GROUP_NAMES.map((name) => ({ name, leadUserIds: [] }))
+  );
   await refreshDashboardMessage();
-
-  setInterval(() => {
-    closeExpiredRallies().catch((error) =>
-      console.error('Failed to close expired rallies', error)
-    );
-  }, 5000);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isButton()) {
-      if (interaction.customId.startsWith('dashboard:')) {
-        if (!hasAccess(interaction.member)) {
-          await interaction.reply({
-            content: `You need the **${RALLY_ROLE_NAME}** role to use this.`,
-            flags: MessageFlags.Ephemeral,
-          });
-          return;
-        }
+      if (interaction.customId === 'lead:register') {
+        const modal = new ModalBuilder()
+          .setCustomId('lead:register_modal')
+          .setTitle('Become Rally Lead');
 
-        if (interaction.customId === 'dashboard:create_rally') {
-          sessions.set(interaction.user.id, {});
-          await interaction.reply({
-            content: 'Select alliance',
-            components: [buildAllianceSelect()],
-            flags: MessageFlags.Ephemeral,
-          });
-          return;
-        }
+        const gameNameInput = new TextInputBuilder()
+          .setCustomId('game_name')
+          .setLabel('Game Name')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder('Seph');
 
-        if (interaction.customId === 'dashboard:view_rallies') {
-          const rallies = activeRallies();
+        const rallySecondsInput = new TextInputBuilder()
+          .setCustomId('rally_seconds')
+          .setLabel('Rally Time (seconds)')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder('30');
 
-          if (rallies.length === 0) {
-            await interaction.reply({
-              content: 'No active rallies.',
-              flags: MessageFlags.Ephemeral,
-            });
-            return;
-          }
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(gameNameInput),
+          new ActionRowBuilder().addComponents(rallySecondsInput)
+        );
 
-          const text = rallies
-            .map((r, i) => {
-              const counts = Object.entries(r.teams)
-                .map(([name, users]) => `${name}: ${users.length}`)
-                .join(' | ');
-
-              return [
-                `**${i + 1}. ${r.type} - ${r.alliance}**`,
-                `Starts: <t:${Math.floor(r.time / 1000)}:R>`,
-                counts,
-              ].join('\n');
-            })
-            .join('\n\n')
-            .slice(0, 3500);
-
-          await interaction.reply({
-            embeds: [
-              new EmbedBuilder()
-                .setTitle('Active Rallies')
-                .setDescription(text),
-            ],
-            flags: MessageFlags.Ephemeral,
-          });
-          return;
-        }
-
-        if (interaction.customId === 'dashboard:refresh') {
-          await refreshDashboardMessage();
-          await interaction.reply({
-            content: 'Dashboard refreshed.',
-            flags: MessageFlags.Ephemeral,
-          });
-          return;
-        }
+        await interaction.showModal(modal);
+        return;
       }
 
-      if (interaction.customId.startsWith('team:')) {
-        const [, rallyId, teamName] = interaction.customId.split(':');
-        const rallies = loadRallies();
-        const rally = rallies.find((r) => r.id === rallyId);
-
-        if (!rally || !rally.active) {
-          await interaction.reply({
-            content: 'This rally is no longer active.',
-            flags: MessageFlags.Ephemeral,
-          });
-          return;
-        }
-
-        const userId = interaction.user.id;
-
-        for (const team of Object.keys(rally.teams)) {
-          rally.teams[team] = rally.teams[team].filter((id) => id !== userId);
-        }
-
-        rally.teams[teamName].push(userId);
-
-        saveRallies(rallies);
-        await refreshRallyMessage(rally);
+      if (interaction.customId === 'dashboard:refresh') {
         await refreshDashboardMessage();
-
         await interaction.reply({
-          content: `You joined **${teamName}**.`,
+          content: 'Dashboard refreshed.',
           flags: MessageFlags.Ephemeral,
         });
         return;
+      }
+
+      if (
+        interaction.customId === 'group:assign' ||
+        interaction.customId === 'group:calculate'
+      ) {
+        if (!hasManagerAccess(interaction.member)) {
+          await interaction.reply({
+            content: `You need the **${RALLY_MANAGER_ROLE_NAME}** role to use this.`,
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        if (interaction.customId === 'group:assign') {
+          sessions.set(interaction.user.id, { flow: 'assign_group' });
+
+          await interaction.reply({
+            content: 'Select a group.',
+            components: [buildGroupSelect('group:assign_select_group')],
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        if (interaction.customId === 'group:calculate') {
+          sessions.set(interaction.user.id, { flow: 'calculate_group' });
+
+          await interaction.reply({
+            content: 'Select a group to calculate.',
+            components: [buildGroupSelect('group:calculate_select_group')],
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
       }
     }
 
     if (interaction.isStringSelectMenu()) {
-      const session = sessions.get(interaction.user.id);
-      if (!session) return;
-
-      if (!hasAccess(interaction.member)) {
-        await interaction.reply({
-          content: `You need the **${RALLY_ROLE_NAME}** role to use this.`,
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
+      if (
+        interaction.customId === 'group:assign_select_group' ||
+        interaction.customId === 'group:calculate_select_group' ||
+        interaction.customId === 'group:assign_select_lead'
+      ) {
+        if (!hasManagerAccess(interaction.member)) {
+          await interaction.reply({
+            content: `You need the **${RALLY_MANAGER_ROLE_NAME}** role to use this.`,
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
       }
 
-      if (interaction.customId === 'rally:alliance') {
-        session.alliance = interaction.values[0];
+      if (interaction.customId === 'group:assign_select_group') {
+        const groupName = interaction.values[0];
+        const session = sessions.get(interaction.user.id) || {};
+        session.groupName = groupName;
         sessions.set(interaction.user.id, session);
 
-        await interaction.update({
-          content: 'Select rally type',
-          components: [buildTypeSelect()],
-        });
-        return;
-      }
-
-      if (interaction.customId === 'rally:type') {
-        session.type = interaction.values[0];
-        sessions.set(interaction.user.id, session);
-
-        await interaction.update({
-          content: 'Select start time',
-          components: [buildStartSelect()],
-        });
-        return;
-      }
-
-      if (interaction.customId === 'rally:start') {
-        const seconds = Number(interaction.values[0]);
-
-        const rally = {
-          id: makeId(),
-          alliance: session.alliance,
-          type: session.type,
-          time: Date.now() + seconds * 1000,
-          teams: createTeams(),
-          active: true,
-          createdBy: interaction.user.id,
-          createdAt: new Date().toISOString(),
-        };
-
-        const rallies = loadRallies();
-        rallies.push(rally);
-        saveRallies(rallies);
-        sessions.delete(interaction.user.id);
-
-        const channel = await client.channels.fetch(SVS_CHANNEL_ID);
-        if (!channel || !channel.isTextBased()) {
+        const leadSelect = buildLeadSelect('group:assign_select_lead');
+        if (!leadSelect) {
           await interaction.update({
-            content: 'SvS channel is not available.',
+            content: 'No rally leads are registered yet.',
             components: [],
           });
           return;
         }
 
-        const sent = await channel.send({
-          content: buildRallyText(rally),
-          components: [buildTeamButtons(rally.id)],
+        await interaction.update({
+          content: `Selected **${groupName}**. Now select a rally lead.`,
+          components: [leadSelect],
         });
+        return;
+      }
 
-        rally.messageId = sent.id;
+      if (interaction.customId === 'group:assign_select_lead') {
+        const userId = interaction.values[0];
+        const session = sessions.get(interaction.user.id);
 
-        const updatedRallies = loadRallies().map((r) =>
-          r.id === rally.id ? { ...r, messageId: sent.id } : r
+        if (!session?.groupName) {
+          await interaction.reply({
+            content: 'Your session expired. Please start again.',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        const groups = loadGroups();
+
+        for (const group of groups) {
+          group.leadUserIds = group.leadUserIds.filter((id) => id !== userId);
+        }
+
+        const targetGroup = groups.find((g) => g.name === session.groupName);
+        if (!targetGroup) {
+          await interaction.update({
+            content: 'Group not found.',
+            components: [],
+          });
+          return;
+        }
+
+        if (!targetGroup.leadUserIds.includes(userId)) {
+          targetGroup.leadUserIds.push(userId);
+        }
+
+        saveGroups(groups);
+        sessions.delete(interaction.user.id);
+        await refreshDashboardMessage();
+
+        const leads = loadLeads();
+        const lead = leads.find((l) => l.userId === userId);
+
+        await interaction.update({
+          content: `Assigned **${lead?.gameName || userId}** to **${targetGroup.name}**.`,
+          components: [],
+        });
+        return;
+      }
+
+      if (interaction.customId === 'group:calculate_select_group') {
+        const groupName = interaction.values[0];
+        const session = sessions.get(interaction.user.id) || {};
+        session.groupName = groupName;
+        sessions.set(interaction.user.id, session);
+
+        const modal = new ModalBuilder()
+          .setCustomId('group:calculate_modal')
+          .setTitle('Calculate Launch Times');
+
+        const arrivalInput = new TextInputBuilder()
+          .setCustomId('arrival_time')
+          .setLabel('Arrival Time UTC (HH:mm:ss)')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder('19:00:00');
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(arrivalInput)
         );
-        saveRallies(updatedRallies);
+
+        await interaction.showModal(modal);
+        return;
+      }
+    }
+
+    if (interaction.type === InteractionType.ModalSubmit) {
+      if (interaction.customId === 'lead:register_modal') {
+        const gameName = interaction.fields.getTextInputValue('game_name').trim();
+        const rallySeconds = Number(
+          interaction.fields.getTextInputValue('rally_seconds').trim()
+        );
+
+        if (!gameName) {
+          await interaction.reply({
+            content: 'Game Name is required.',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        if (!Number.isFinite(rallySeconds) || rallySeconds <= 0) {
+          await interaction.reply({
+            content: 'Rally Time must be a valid number greater than 0.',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        upsertLead({
+          userId: interaction.user.id,
+          discordName: interaction.member?.displayName || interaction.user.username,
+          gameName,
+          rallySeconds,
+        });
 
         await refreshDashboardMessage();
 
-        await interaction.update({
-          content: `🔥 Rally created (${seconds}s)`,
-          components: [],
+        await interaction.reply({
+          content: `Registered **${gameName}** with rally time **${rallySeconds}s**.`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      if (interaction.customId === 'group:calculate_modal') {
+        if (!hasManagerAccess(interaction.member)) {
+          await interaction.reply({
+            content: `You need the **${RALLY_MANAGER_ROLE_NAME}** role to use this.`,
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        const session = sessions.get(interaction.user.id);
+        if (!session?.groupName) {
+          await interaction.reply({
+            content: 'Your session expired. Please start again.',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        const arrivalInput = interaction.fields.getTextInputValue('arrival_time');
+        const arrivalTime = parseUtcTimeOnly(arrivalInput);
+
+        if (!arrivalTime) {
+          await interaction.reply({
+            content: 'Invalid time. Use UTC format `HH:mm:ss`.',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        const groups = loadGroups();
+        const leads = loadLeads();
+        const group = groups.find((g) => g.name === session.groupName);
+
+        if (!group) {
+          await interaction.reply({
+            content: 'Group not found.',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        const groupLeads = group.leadUserIds
+          .map((id) => leads.find((lead) => lead.userId === id))
+          .filter(Boolean);
+
+        if (groupLeads.length === 0) {
+          await interaction.reply({
+            content: 'That group has no rally leads assigned.',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        const channel = await client.channels.fetch(SVS_CHANNEL_ID);
+        if (!channel || !channel.isTextBased()) {
+          await interaction.reply({
+            content: 'SvS channel is not available.',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        await channel.send({
+          embeds: [buildLaunchPlanEmbed(group.name, arrivalTime, groupLeads)],
+        });
+
+        sessions.delete(interaction.user.id);
+
+        await interaction.reply({
+          content: `Launch plan posted for **${group.name}**.`,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -498,19 +651,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
     console.error('Interaction error', error);
 
     if (interaction.deferred || interaction.replied) {
-      await interaction
-        .followUp({
-          content: 'Something went wrong.',
-          flags: MessageFlags.Ephemeral,
-        })
-        .catch(() => null);
+      await interaction.followUp({
+        content: 'Something went wrong.',
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => null);
     } else {
-      await interaction
-        .reply({
-          content: 'Something went wrong.',
-          flags: MessageFlags.Ephemeral,
-        })
-        .catch(() => null);
+      await interaction.reply({
+        content: 'Something went wrong.',
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => null);
     }
   }
 });
