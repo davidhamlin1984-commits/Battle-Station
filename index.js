@@ -51,12 +51,11 @@ let leads = [];
 let groups = [];
 let uiState = {
   dashboardMessageId: null,
-  launchPlanMessageId: null,
+  selectedGroupName: 'ST8 Rally 1',
 };
 
 let refreshInFlight = false;
 let lastDashboardHash = '';
-let lastLaunchPlanHash = '';
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -149,8 +148,12 @@ function saveGroupsToDisk() {
 function loadUiStateFromDisk() {
   uiState = readJson(uiStatePath, {
     dashboardMessageId: null,
-    launchPlanMessageId: null,
+    selectedGroupName: 'ST8 Rally 1',
   });
+
+  if (!uiState.selectedGroupName) {
+    uiState.selectedGroupName = 'ST8 Rally 1';
+  }
 }
 
 function saveUiStateToDisk() {
@@ -262,6 +265,94 @@ function upsertManualLeadInMemory({ gameName, rallySeconds, discordUserId }) {
   saveLeadsToDisk();
 }
 
+function getLeadByStoredId(id) {
+  return leads.find((lead) => lead.userId === id || lead.manualId === id);
+}
+
+function buildPlanLinesForGroup(arrivalTime, selectedLeads) {
+  const rows = selectedLeads
+    .map((lead) => {
+      const launchTime = new Date(
+        arrivalTime.getTime() - getTotalTravelSeconds(lead) * 1000
+      );
+
+      return {
+        gameName: lead.gameName,
+        launchTime,
+      };
+    })
+    .sort((a, b) => a.launchTime.getTime() - b.launchTime.getTime());
+
+  const longestName = Math.max(...rows.map((r) => r.gameName.length), 4);
+
+  return rows.map((row) => {
+    const paddedName = row.gameName.padEnd(longestName, ' ');
+    return `${paddedName} - ${formatUtcTime(row.launchTime)}`;
+  });
+}
+
+function clearExpiredPlans() {
+  const now = Date.now();
+  let changed = false;
+
+  for (const group of groups) {
+    if (!group.lastArrivalTime) continue;
+
+    const landTime = new Date(group.lastArrivalTime).getTime();
+    if (!Number.isNaN(landTime) && landTime <= now) {
+      group.lastArrivalTime = null;
+      group.lastCalculatedAt = null;
+      group.lastPlanLines = [];
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    saveGroupsToDisk();
+  }
+}
+
+function buildSendTimeSection() {
+  const selectedGroup =
+    groups.find((g) => g.name === uiState.selectedGroupName) || groups[0];
+
+  if (!selectedGroup) {
+    return [
+      '**📨 Send Time Info**',
+      'No groups found.',
+    ].join('\n');
+  }
+
+  const landDate = selectedGroup.lastArrivalTime
+    ? new Date(selectedGroup.lastArrivalTime)
+    : null;
+
+  const hasActivePlan =
+    landDate &&
+    !Number.isNaN(landDate.getTime()) &&
+    landDate.getTime() > Date.now() &&
+    Array.isArray(selectedGroup.lastPlanLines) &&
+    selectedGroup.lastPlanLines.length > 0;
+
+  if (!hasActivePlan) {
+    return [
+      '**📨 Send Time Info**',
+      `${selectedGroup.name}`,
+      'No active launch plan.',
+    ].join('\n');
+  }
+
+  return [
+    '**📨 Send Time Info**',
+    `${selectedGroup.name}`,
+    `🎯 Land: ${formatUtcTime(landDate)} (${formatCountdownToDate(landDate)})`,
+    '',
+    '```',
+    ...selectedGroup.lastPlanLines,
+    '```',
+  ].join('\n');
+}
+
 function buildDashboardDescription() {
   const now = Date.now();
 
@@ -273,7 +364,7 @@ function buildDashboardDescription() {
           .map((lead, i) => {
             const mention = lead.userId ? ` - <@${lead.userId}>` : '';
             const source = lead.source === 'manual' ? ' [manual]' : '';
-            return `**${i + 1}. ${lead.gameName}** - ${lead.rallySeconds}s${mention}${source}`;
+            return `**${i + 1}. ${lead.gameName}**\n- ${lead.rallySeconds}s${mention}${source}`;
           })
           .join('\n');
 
@@ -284,7 +375,7 @@ function buildDashboardDescription() {
           ? 'Empty'
           : group.leadUserIds
               .map((id) => {
-                const lead = leads.find((l) => l.userId === id || l.manualId === id);
+                const lead = getLeadByStoredId(id);
                 return lead ? lead.gameName : id;
               })
               .join(', ');
@@ -306,11 +397,13 @@ function buildDashboardDescription() {
     .join('\n');
 
   return [
-    `**👤 Rally Leads**`,
+    '**👤 Rally Leads**',
     leadText,
     '',
-    `**🧩 Groups**`,
+    '**🧩 Groups**',
     groupText,
+    '',
+    buildSendTimeSection(),
   ].join('\n');
 }
 
@@ -318,46 +411,6 @@ function buildDashboardEmbed() {
   return new EmbedBuilder()
     .setTitle('SvS Command Dashboard')
     .setDescription(buildDashboardDescription());
-}
-
-function buildLaunchPlanEmbed() {
-  const groupsWithPlans = groups
-    .filter((g) => Array.isArray(g.lastPlanLines) && g.lastPlanLines.length > 0)
-    .sort((a, b) => {
-      const aTime = a.lastCalculatedAt ? new Date(a.lastCalculatedAt).getTime() : 0;
-      const bTime = b.lastCalculatedAt ? new Date(b.lastCalculatedAt).getTime() : 0;
-      return bTime - aTime;
-    });
-
-  if (groupsWithPlans.length === 0) {
-    return new EmbedBuilder()
-      .setTitle('Current Launch Plan')
-      .setDescription('No launch plan calculated yet.');
-  }
-
-  const group = groupsWithPlans[0];
-  const landDate = group.lastArrivalTime ? new Date(group.lastArrivalTime) : null;
-  const landLine =
-    landDate && !Number.isNaN(landDate.getTime())
-      ? `🎯 **Land Time:** ${formatUtcTime(landDate)} (${formatCountdownToDate(
-          landDate
-        )})`
-      : null;
-
-  return new EmbedBuilder()
-    .setTitle(`${group.name} Launch Plan`)
-    .setDescription(
-      [
-        landLine,
-        '',
-        '```',
-        ...group.lastPlanLines,
-        '```',
-      ]
-        .filter(Boolean)
-        .join('\n')
-    )
-    .setFooter({ text: 'Rounded to next 15 seconds' });
 }
 
 function buildDashboardRows() {
@@ -385,6 +438,42 @@ function buildDashboardRows() {
         .setCustomId('group:calculate')
         .setLabel('Calculate Launch Times')
         .setStyle(ButtonStyle.Primary)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('view:ST8 Rally 1')
+        .setLabel('ST8 Rally 1')
+        .setStyle(
+          uiState.selectedGroupName === 'ST8 Rally 1'
+            ? ButtonStyle.Primary
+            : ButtonStyle.Secondary
+        ),
+      new ButtonBuilder()
+        .setCustomId('view:ST8 Rally 2')
+        .setLabel('ST8 Rally 2')
+        .setStyle(
+          uiState.selectedGroupName === 'ST8 Rally 2'
+            ? ButtonStyle.Primary
+            : ButtonStyle.Secondary
+        )
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('view:ST2 Rally 1')
+        .setLabel('ST2 Rally 1')
+        .setStyle(
+          uiState.selectedGroupName === 'ST2 Rally 1'
+            ? ButtonStyle.Primary
+            : ButtonStyle.Secondary
+        ),
+      new ButtonBuilder()
+        .setCustomId('view:ST2 Rally 2')
+        .setLabel('ST2 Rally 2')
+        .setStyle(
+          uiState.selectedGroupName === 'ST2 Rally 2'
+            ? ButtonStyle.Primary
+            : ButtonStyle.Secondary
+        )
     ),
   ];
 }
@@ -447,37 +536,18 @@ async function getTextChannel() {
   return channel;
 }
 
-async function upsertManagedMessage(channel, messageId, payload, stateKey) {
-  let msg = null;
-
-  if (messageId) {
-    try {
-      msg = await channel.messages.fetch(messageId);
-    } catch (error) {
-      msg = null;
-    }
-  }
-
-  if (msg) {
-    await msg.edit(payload);
-    return msg.id;
-  }
-
-  const sent = await channel.send(payload);
-  uiState[stateKey] = sent.id;
-  saveUiStateToDisk();
-  return sent.id;
-}
-
 async function refreshDashboardMessage(force = false) {
   if (refreshInFlight) return;
   refreshInFlight = true;
 
   try {
+    clearExpiredPlans();
+
     const channel = await getTextChannel();
     const description = buildDashboardDescription();
     const nextHash = JSON.stringify({
       description,
+      selectedGroupName: uiState.selectedGroupName,
       dashboardMessageId: uiState.dashboardMessageId,
     });
 
@@ -490,12 +560,23 @@ async function refreshDashboardMessage(force = false) {
       components: buildDashboardRows(),
     };
 
-    uiState.dashboardMessageId = await upsertManagedMessage(
-      channel,
-      uiState.dashboardMessageId,
-      payload,
-      'dashboardMessageId'
-    );
+    let msg = null;
+
+    if (uiState.dashboardMessageId) {
+      try {
+        msg = await channel.messages.fetch(uiState.dashboardMessageId);
+      } catch (error) {
+        msg = null;
+      }
+    }
+
+    if (msg) {
+      await msg.edit(payload);
+    } else {
+      const sent = await channel.send(payload);
+      uiState.dashboardMessageId = sent.id;
+      saveUiStateToDisk();
+    }
 
     lastDashboardHash = nextHash;
   } catch (error) {
@@ -503,64 +584,6 @@ async function refreshDashboardMessage(force = false) {
   } finally {
     refreshInFlight = false;
   }
-}
-
-async function refreshLaunchPlanMessage(force = false) {
-  try {
-    const channel = await getTextChannel();
-    const embed = buildLaunchPlanEmbed();
-    const nextHash = JSON.stringify({
-      title: embed.data.title,
-      description: embed.data.description,
-      launchPlanMessageId: uiState.launchPlanMessageId,
-    });
-
-    if (!force && uiState.launchPlanMessageId && nextHash === lastLaunchPlanHash) {
-      return;
-    }
-
-    const payload = {
-      embeds: [embed],
-    };
-
-    uiState.launchPlanMessageId = await upsertManagedMessage(
-      channel,
-      uiState.launchPlanMessageId,
-      payload,
-      'launchPlanMessageId'
-    );
-
-    lastLaunchPlanHash = nextHash;
-  } catch (error) {
-    console.error('Failed to refresh launch plan message', error);
-  }
-}
-
-async function refreshUi(force = false) {
-  await refreshDashboardMessage(force);
-  await refreshLaunchPlanMessage(force);
-}
-
-function buildPlanLinesForGroup(arrivalTime, selectedLeads) {
-  const rows = selectedLeads
-    .map((lead) => {
-      const launchTime = new Date(
-        arrivalTime.getTime() - getTotalTravelSeconds(lead) * 1000
-      );
-
-      return {
-        gameName: lead.gameName,
-        launchTime,
-      };
-    })
-    .sort((a, b) => a.launchTime.getTime() - b.launchTime.getTime());
-
-  const longestName = Math.max(...rows.map((r) => r.gameName.length), 4);
-
-  return rows.map((row) => {
-    const paddedName = row.gameName.padEnd(longestName, ' ');
-    return `${paddedName} - ${formatUtcTime(row.launchTime)}`;
-  });
 }
 
 client.once(Events.ClientReady, async () => {
@@ -579,18 +602,18 @@ client.once(Events.ClientReady, async () => {
   );
   ensureJsonFile(uiStatePath, {
     dashboardMessageId: null,
-    launchPlanMessageId: null,
+    selectedGroupName: 'ST8 Rally 1',
   });
 
   leads = loadLeadsFromDisk();
   groups = loadGroupsFromDisk();
   loadUiStateFromDisk();
 
-  await refreshUi(true);
+  await refreshDashboardMessage(true);
 
   setInterval(() => {
-    refreshUi(false).catch((error) =>
-      console.error('Failed to refresh UI on interval', error)
+    refreshDashboardMessage(false).catch((error) =>
+      console.error('Failed to refresh dashboard on interval', error)
     );
   }, 1000);
 });
@@ -598,6 +621,18 @@ client.once(Events.ClientReady, async () => {
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith('view:')) {
+        await interaction.deferUpdate();
+        const groupName = interaction.customId.replace('view:', '');
+
+        if (GROUP_NAMES.includes(groupName)) {
+          uiState.selectedGroupName = groupName;
+          saveUiStateToDisk();
+          await refreshDashboardMessage(true);
+        }
+        return;
+      }
+
       if (interaction.customId === 'lead:register') {
         const modal = new ModalBuilder()
           .setCustomId('lead:register_modal')
@@ -672,9 +707,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (interaction.customId === 'dashboard:refresh') {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        await refreshUi(true);
+        await refreshDashboardMessage(true);
         await interaction.editReply({
-          content: 'Dashboard and launch plan refreshed.',
+          content: 'Dashboard refreshed.',
         });
         return;
       }
@@ -788,11 +823,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         saveGroupsToDisk();
         sessions.delete(interaction.user.id);
-        await refreshUi(true);
+        await refreshDashboardMessage(true);
 
-        const lead = leads.find(
-          (l) => l.userId === selectedLeadId || l.manualId === selectedLeadId
-        );
+        const lead = getLeadByStoredId(selectedLeadId);
 
         await interaction.followUp({
           content: `Assigned **${lead?.gameName || selectedLeadId}** to **${targetGroup.name}**.`,
@@ -838,9 +871,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         const groupLeads = group.leadUserIds
-          .map((id) =>
-            leads.find((lead) => lead.userId === id || lead.manualId === id)
-          )
+          .map((id) => getLeadByStoredId(id))
           .filter(Boolean);
 
         if (groupLeads.length === 0) {
@@ -869,15 +900,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         group.lastCalculatedAt = new Date().toISOString();
         group.lastPlanLines = buildPlanLinesForGroup(arrivalTime, groupLeads);
 
-        for (const otherGroup of groups) {
-          if (otherGroup.name !== group.name) {
-            otherGroup.lastCalculatedAt = otherGroup.lastCalculatedAt || null;
-          }
-        }
+        uiState.selectedGroupName = group.name;
 
         saveGroupsToDisk();
+        saveUiStateToDisk();
+
         sessions.delete(interaction.user.id);
-        await refreshUi(true);
+        await refreshDashboardMessage(true);
 
         await interaction.followUp({
           content: `Launch plan updated for **${group.name}**.`,
@@ -917,7 +946,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           rallySeconds,
         });
 
-        await refreshUi(true);
+        await refreshDashboardMessage(true);
 
         await interaction.editReply({
           content: `Registered **${gameName}** with rally time **${rallySeconds}s**.`,
@@ -963,7 +992,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           discordUserId: discordUserId || null,
         });
 
-        await refreshUi(true);
+        await refreshDashboardMessage(true);
 
         await interaction.editReply({
           content: `Added rally lead **${gameName}** with rally time **${rallySeconds}s**.`,
