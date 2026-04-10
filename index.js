@@ -334,9 +334,7 @@ function buildLaunchPlanFromOffsetEmbed(
     .setTitle(`${groupName} Launch Plan`)
     .setDescription(
       [
-        `Longest rally starts in **${offsetSeconds}s**`,
-        `Longest launch: ${formatUtcTime(longestLaunchTime)}`,
-        `Arrival: ${formatUtcTime(arrivalTime)}`,
+
         '',
         lines,
       ].join('\n')
