@@ -121,37 +121,6 @@ function makeDiscordFullTimestamp(date) {
   return `<t:${Math.floor(date.getTime() / 1000)}:F>`;
 }
 
-function parseUtcTimeOnly(input) {
-  const trimmed = (input || '').trim();
-  const match = trimmed.match(/^(\d{2}):(\d{2}):(\d{2})$/);
-  if (!match) return null;
-
-  const hour = Number(match[1]);
-  const minute = Number(match[2]);
-  const second = Number(match[3]);
-
-  if (
-    hour < 0 || hour > 23 ||
-    minute < 0 || minute > 59 ||
-    second < 0 || second > 59
-  ) {
-    return null;
-  }
-
-  const now = new Date();
-  const target = new Date(Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate(),
-    hour,
-    minute,
-    second,
-    0
-  ));
-
-  return target;
-}
-
 function upsertLead({ userId, discordName, gameName, rallySeconds }) {
   const leads = loadLeads();
   const existing = leads.find((l) => l.userId === userId);
@@ -273,8 +242,22 @@ function buildLeadSelect(customId) {
         leads.slice(0, 25).map((lead) => ({
           label: `${lead.gameName} (${lead.rallySeconds}s)`.slice(0, 100),
           value: lead.userId,
-          description: lead.discordName?.slice(0, 100) || `User ${lead.userId}`,
+          description: (lead.discordName || `User ${lead.userId}`).slice(0, 100),
         }))
+      )
+  );
+}
+
+function buildLaunchOffsetSelect() {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('group:calculate_select_offset')
+      .setPlaceholder('Select launch offset')
+      .addOptions(
+        { label: '15 seconds from now', value: '15' },
+        { label: '30 seconds from now', value: '30' },
+        { label: '45 seconds from now', value: '45' },
+        { label: '60 seconds from now', value: '60' }
       )
   );
 }
@@ -317,12 +300,33 @@ async function refreshDashboardMessage() {
   }
 }
 
-function buildLaunchPlanEmbed(groupName, arrivalTime, leads) {
+function buildLaunchPlanFromOffsetEmbed(
+  groupName,
+  offsetSeconds,
+  longestLaunchTime,
+  arrivalTime,
+  leads
+) {
+  const maxRallySeconds = Math.max(...leads.map((lead) => lead.rallySeconds));
+
   const lines = leads
     .map((lead) => {
-      const launchTime = new Date(arrivalTime.getTime() - lead.rallySeconds * 1000);
+      const launchTime = new Date(
+        arrivalTime.getTime() - lead.rallySeconds * 1000
+      );
+      const secondsFromNow = Math.max(
+        0,
+        Math.round((launchTime.getTime() - Date.now()) / 1000)
+      );
+
+      const marker =
+        lead.rallySeconds === maxRallySeconds
+          ? `Longest rally starts in **${offsetSeconds}s**`
+          : `Starts in **${secondsFromNow}s**`;
+
       return [
-        `**${lead.gameName}** - ${lead.rallySeconds}s`,
+        `**${lead.gameName}** - ${lead.rallySeconds}s - <@${lead.userId}>`,
+        `${marker}`,
         `Launch: ${makeDiscordTimestamp(launchTime)} (${makeDiscordFullTimestamp(launchTime)})`,
       ].join('\n');
     })
@@ -332,9 +336,10 @@ function buildLaunchPlanEmbed(groupName, arrivalTime, leads) {
     .setTitle(`${groupName} Launch Plan`)
     .setDescription(
       [
+        `**Longest rally launch offset:** **${offsetSeconds}s from now**`,
         `**Target Arrival:** ${makeDiscordTimestamp(arrivalTime)} (${makeDiscordFullTimestamp(arrivalTime)})`,
         '',
-        lines || 'No leads assigned.',
+        lines,
       ].join('\n')
     );
 }
@@ -429,7 +434,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (
         interaction.customId === 'group:assign_select_group' ||
         interaction.customId === 'group:calculate_select_group' ||
-        interaction.customId === 'group:assign_select_lead'
+        interaction.customId === 'group:assign_select_lead' ||
+        interaction.customId === 'group:calculate_select_offset'
       ) {
         if (!hasManagerAccess(interaction.member)) {
           await interaction.reply({
@@ -513,22 +519,84 @@ client.on(Events.InteractionCreate, async (interaction) => {
         session.groupName = groupName;
         sessions.set(interaction.user.id, session);
 
-        const modal = new ModalBuilder()
-          .setCustomId('group:calculate_modal')
-          .setTitle('Calculate Launch Times');
+        await interaction.update({
+          content: `Selected **${groupName}**. Now choose when the longest rally should launch.`,
+          components: [buildLaunchOffsetSelect()],
+        });
+        return;
+      }
 
-        const arrivalInput = new TextInputBuilder()
-          .setCustomId('arrival_time')
-          .setLabel('Arrival Time UTC (HH:mm:ss)')
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true)
-          .setPlaceholder('19:00:00');
+      if (interaction.customId === 'group:calculate_select_offset') {
+        const session = sessions.get(interaction.user.id);
+        if (!session?.groupName) {
+          await interaction.reply({
+            content: 'Your session expired. Please start again.',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
 
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(arrivalInput)
+        const offsetSeconds = Number(interaction.values[0]);
+        const groups = loadGroups();
+        const leads = loadLeads();
+        const group = groups.find((g) => g.name === session.groupName);
+
+        if (!group) {
+          await interaction.update({
+            content: 'Group not found.',
+            components: [],
+          });
+          return;
+        }
+
+        const groupLeads = group.leadUserIds
+          .map((id) => leads.find((lead) => lead.userId === id))
+          .filter(Boolean);
+
+        if (groupLeads.length === 0) {
+          await interaction.update({
+            content: 'That group has no rally leads assigned.',
+            components: [],
+          });
+          return;
+        }
+
+        const maxRallySeconds = Math.max(
+          ...groupLeads.map((lead) => lead.rallySeconds)
+        );
+        const now = new Date();
+        const longestLaunchTime = new Date(now.getTime() + offsetSeconds * 1000);
+        const arrivalTime = new Date(
+          longestLaunchTime.getTime() + maxRallySeconds * 1000
         );
 
-        await interaction.showModal(modal);
+        const channel = await client.channels.fetch(SVS_CHANNEL_ID);
+        if (!channel || !channel.isTextBased()) {
+          await interaction.update({
+            content: 'SvS channel is not available.',
+            components: [],
+          });
+          return;
+        }
+
+        await channel.send({
+          embeds: [
+            buildLaunchPlanFromOffsetEmbed(
+              group.name,
+              offsetSeconds,
+              longestLaunchTime,
+              arrivalTime,
+              groupLeads
+            ),
+          ],
+        });
+
+        sessions.delete(interaction.user.id);
+
+        await interaction.update({
+          content: `Launch plan posted for **${group.name}**.`,
+          components: [],
+        });
         return;
       }
     }
@@ -567,81 +635,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         await interaction.reply({
           content: `Registered **${gameName}** with rally time **${rallySeconds}s**.`,
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
-
-      if (interaction.customId === 'group:calculate_modal') {
-        if (!hasManagerAccess(interaction.member)) {
-          await interaction.reply({
-            content: `You need the **${RALLY_MANAGER_ROLE_NAME}** role to use this.`,
-            flags: MessageFlags.Ephemeral,
-          });
-          return;
-        }
-
-        const session = sessions.get(interaction.user.id);
-        if (!session?.groupName) {
-          await interaction.reply({
-            content: 'Your session expired. Please start again.',
-            flags: MessageFlags.Ephemeral,
-          });
-          return;
-        }
-
-        const arrivalInput = interaction.fields.getTextInputValue('arrival_time');
-        const arrivalTime = parseUtcTimeOnly(arrivalInput);
-
-        if (!arrivalTime) {
-          await interaction.reply({
-            content: 'Invalid time. Use UTC format `HH:mm:ss`.',
-            flags: MessageFlags.Ephemeral,
-          });
-          return;
-        }
-
-        const groups = loadGroups();
-        const leads = loadLeads();
-        const group = groups.find((g) => g.name === session.groupName);
-
-        if (!group) {
-          await interaction.reply({
-            content: 'Group not found.',
-            flags: MessageFlags.Ephemeral,
-          });
-          return;
-        }
-
-        const groupLeads = group.leadUserIds
-          .map((id) => leads.find((lead) => lead.userId === id))
-          .filter(Boolean);
-
-        if (groupLeads.length === 0) {
-          await interaction.reply({
-            content: 'That group has no rally leads assigned.',
-            flags: MessageFlags.Ephemeral,
-          });
-          return;
-        }
-
-        const channel = await client.channels.fetch(SVS_CHANNEL_ID);
-        if (!channel || !channel.isTextBased()) {
-          await interaction.reply({
-            content: 'SvS channel is not available.',
-            flags: MessageFlags.Ephemeral,
-          });
-          return;
-        }
-
-        await channel.send({
-          embeds: [buildLaunchPlanEmbed(group.name, arrivalTime, groupLeads)],
-        });
-
-        sessions.delete(interaction.user.id);
-
-        await interaction.reply({
-          content: `Launch plan posted for **${group.name}**.`,
           flags: MessageFlags.Ephemeral,
         });
         return;
