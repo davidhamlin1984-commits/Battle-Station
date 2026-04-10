@@ -377,9 +377,9 @@ function buildLaunchOffsetSelect() {
 function buildLaunchPlanFromOffsetEmbed(
   groupName,
   arrivalTime,
-  leads
+  groupLeads
 ) {
-  const lines = leads
+  const lines = groupLeads
     .map((lead) => {
       const launchTime = new Date(
         arrivalTime.getTime() - getTotalTravelSeconds(lead) * 1000
@@ -767,8 +767,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           embeds: [
             buildLaunchPlanFromOffsetEmbed(
               group.name,
-              offsetSeconds,
-              longestLaunchTime,
               arrivalTime,
               groupLeads
             ),
