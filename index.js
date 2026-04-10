@@ -38,7 +38,7 @@ const sessions = new Map();
 
 const leadsPath = path.join(DATA_DIR, 'rally_leads.json');
 const groupsPath = path.join(DATA_DIR, 'rally_groups.json');
-const dashboardStatePath = path.join(DATA_DIR, 'dashboard_state.json');
+const uiStatePath = path.join(DATA_DIR, 'ui_state.json');
 
 const GROUP_NAMES = [
   'ST8 Rally 1',
@@ -49,9 +49,14 @@ const GROUP_NAMES = [
 
 let leads = [];
 let groups = [];
-let dashboardMessageId = null;
+let uiState = {
+  dashboardMessageId: null,
+  launchPlanMessageId: null,
+};
+
 let refreshInFlight = false;
 let lastDashboardHash = '';
+let lastLaunchPlanHash = '';
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -95,6 +100,7 @@ function loadGroupsFromDisk() {
     leadUserIds: [],
     lastArrivalTime: null,
     lastCalculatedAt: null,
+    lastPlanLines: [],
   }));
 
   const loaded = readJson(groupsPath, defaultGroups);
@@ -108,6 +114,7 @@ function loadGroupsFromDisk() {
         leadUserIds: [],
         lastArrivalTime: null,
         lastCalculatedAt: null,
+        lastPlanLines: [],
       });
       changed = true;
     }
@@ -120,6 +127,10 @@ function loadGroupsFromDisk() {
     }
     if (!Object.prototype.hasOwnProperty.call(group, 'lastCalculatedAt')) {
       group.lastCalculatedAt = null;
+      changed = true;
+    }
+    if (!Object.prototype.hasOwnProperty.call(group, 'lastPlanLines')) {
+      group.lastPlanLines = [];
       changed = true;
     }
   }
@@ -135,13 +146,15 @@ function saveGroupsToDisk() {
   writeJson(groupsPath, groups);
 }
 
-function loadDashboardState() {
-  const state = readJson(dashboardStatePath, { dashboardMessageId: null });
-  dashboardMessageId = state.dashboardMessageId || null;
+function loadUiStateFromDisk() {
+  uiState = readJson(uiStatePath, {
+    dashboardMessageId: null,
+    launchPlanMessageId: null,
+  });
 }
 
-function saveDashboardState() {
-  writeJson(dashboardStatePath, { dashboardMessageId });
+function saveUiStateToDisk() {
+  writeJson(uiStatePath, uiState);
 }
 
 function hasManagerAccess(member) {
@@ -268,11 +281,11 @@ function buildDashboardDescription() {
     .map((group) => {
       const members =
         group.leadUserIds.length === 0
-          ? 'None'
+          ? 'Empty'
           : group.leadUserIds
               .map((id) => {
                 const lead = leads.find((l) => l.userId === id || l.manualId === id);
-                return lead ? `${lead.gameName}` : id;
+                return lead ? lead.gameName : id;
               })
               .join(', ');
 
@@ -280,19 +293,71 @@ function buildDashboardDescription() {
       if (group.lastArrivalTime) {
         const landDate = new Date(group.lastArrivalTime);
         if (!Number.isNaN(landDate.getTime()) && landDate.getTime() > now) {
-          suffix = ` | Land: ${formatUtcTime(
+          suffix = ` — 🎯 ${formatUtcTime(
             landDate
-          )} | ${formatCountdownToDate(landDate)}`;
+          )} — ${formatCountdownToDate(landDate)}`;
         } else if (!Number.isNaN(landDate.getTime())) {
-          suffix = ` | Land: ${formatUtcTime(landDate)} | 00:00`;
+          suffix = ` — 🎯 ${formatUtcTime(landDate)} — 00:00`;
         }
       }
 
-      return `**${group.name}**: ${members}${suffix}`;
+      return `**${group.name}** — ${members}${suffix}`;
     })
     .join('\n');
 
-  return [`**Rally Leads**`, leadText, '', `**Groups**`, groupText].join('\n');
+  return [
+    `**👤 Rally Leads**`,
+    leadText,
+    '',
+    `**🧩 Groups**`,
+    groupText,
+  ].join('\n');
+}
+
+function buildDashboardEmbed() {
+  return new EmbedBuilder()
+    .setTitle('SvS Command Dashboard')
+    .setDescription(buildDashboardDescription());
+}
+
+function buildLaunchPlanEmbed() {
+  const groupsWithPlans = groups
+    .filter((g) => Array.isArray(g.lastPlanLines) && g.lastPlanLines.length > 0)
+    .sort((a, b) => {
+      const aTime = a.lastCalculatedAt ? new Date(a.lastCalculatedAt).getTime() : 0;
+      const bTime = b.lastCalculatedAt ? new Date(b.lastCalculatedAt).getTime() : 0;
+      return bTime - aTime;
+    });
+
+  if (groupsWithPlans.length === 0) {
+    return new EmbedBuilder()
+      .setTitle('Current Launch Plan')
+      .setDescription('No launch plan calculated yet.');
+  }
+
+  const group = groupsWithPlans[0];
+  const landDate = group.lastArrivalTime ? new Date(group.lastArrivalTime) : null;
+  const landLine =
+    landDate && !Number.isNaN(landDate.getTime())
+      ? `🎯 **Land Time:** ${formatUtcTime(landDate)} (${formatCountdownToDate(
+          landDate
+        )})`
+      : null;
+
+  return new EmbedBuilder()
+    .setTitle(`${group.name} Launch Plan`)
+    .setDescription(
+      [
+        landLine,
+        '',
+        '```',
+        ...group.lastPlanLines,
+        '```',
+      ]
+        .filter(Boolean)
+        .join('\n')
+    )
+    .setFooter({ text: 'Rounded to next 15 seconds' });
 }
 
 function buildDashboardRows() {
@@ -374,24 +439,34 @@ function buildLaunchOffsetSelect() {
   );
 }
 
-function buildLaunchPlanFromOffsetEmbed(
-  groupName,
-  arrivalTime,
-  groupLeads
-) {
-  const lines = groupLeads
-    .map((lead) => {
-      const launchTime = new Date(
-        arrivalTime.getTime() - getTotalTravelSeconds(lead) * 1000
-      );
+async function getTextChannel() {
+  const channel = await client.channels.fetch(SVS_CHANNEL_ID);
+  if (!channel || !channel.isTextBased()) {
+    throw new Error('SVS channel is not text-based or not found.');
+  }
+  return channel;
+}
 
-      return `${lead.gameName} - ${formatUtcTime(launchTime)}`;
-    })
-    .join('\n');
+async function upsertManagedMessage(channel, messageId, payload, stateKey) {
+  let msg = null;
 
-  return new EmbedBuilder()
-    .setTitle(`${groupName} Launch Plan`)
-    .setDescription(lines);
+  if (messageId) {
+    try {
+      msg = await channel.messages.fetch(messageId);
+    } catch (error) {
+      msg = null;
+    }
+  }
+
+  if (msg) {
+    await msg.edit(payload);
+    return msg.id;
+  }
+
+  const sent = await channel.send(payload);
+  uiState[stateKey] = sent.id;
+  saveUiStateToDisk();
+  return sent.id;
 }
 
 async function refreshDashboardMessage(force = false) {
@@ -399,49 +474,28 @@ async function refreshDashboardMessage(force = false) {
   refreshInFlight = true;
 
   try {
-    const channel = await client.channels.fetch(SVS_CHANNEL_ID);
-
-    if (!channel || !channel.isTextBased()) {
-      console.error('SVS channel is not text-based or not found.');
-      return;
-    }
-
+    const channel = await getTextChannel();
     const description = buildDashboardDescription();
     const nextHash = JSON.stringify({
       description,
-      dashboardMessageId,
+      dashboardMessageId: uiState.dashboardMessageId,
     });
 
-    if (!force && dashboardMessageId && nextHash === lastDashboardHash) {
+    if (!force && uiState.dashboardMessageId && nextHash === lastDashboardHash) {
       return;
     }
 
     const payload = {
-      embeds: [
-        new EmbedBuilder()
-          .setTitle('SvS Rally Lead Dashboard')
-          .setDescription(description),
-      ],
+      embeds: [buildDashboardEmbed()],
       components: buildDashboardRows(),
     };
 
-    let msg = null;
-
-    if (dashboardMessageId) {
-      try {
-        msg = await channel.messages.fetch(dashboardMessageId);
-      } catch (error) {
-        msg = null;
-      }
-    }
-
-    if (msg) {
-      await msg.edit(payload);
-    } else {
-      const sent = await channel.send(payload);
-      dashboardMessageId = sent.id;
-      saveDashboardState();
-    }
+    uiState.dashboardMessageId = await upsertManagedMessage(
+      channel,
+      uiState.dashboardMessageId,
+      payload,
+      'dashboardMessageId'
+    );
 
     lastDashboardHash = nextHash;
   } catch (error) {
@@ -449,6 +503,64 @@ async function refreshDashboardMessage(force = false) {
   } finally {
     refreshInFlight = false;
   }
+}
+
+async function refreshLaunchPlanMessage(force = false) {
+  try {
+    const channel = await getTextChannel();
+    const embed = buildLaunchPlanEmbed();
+    const nextHash = JSON.stringify({
+      title: embed.data.title,
+      description: embed.data.description,
+      launchPlanMessageId: uiState.launchPlanMessageId,
+    });
+
+    if (!force && uiState.launchPlanMessageId && nextHash === lastLaunchPlanHash) {
+      return;
+    }
+
+    const payload = {
+      embeds: [embed],
+    };
+
+    uiState.launchPlanMessageId = await upsertManagedMessage(
+      channel,
+      uiState.launchPlanMessageId,
+      payload,
+      'launchPlanMessageId'
+    );
+
+    lastLaunchPlanHash = nextHash;
+  } catch (error) {
+    console.error('Failed to refresh launch plan message', error);
+  }
+}
+
+async function refreshUi(force = false) {
+  await refreshDashboardMessage(force);
+  await refreshLaunchPlanMessage(force);
+}
+
+function buildPlanLinesForGroup(arrivalTime, selectedLeads) {
+  const rows = selectedLeads
+    .map((lead) => {
+      const launchTime = new Date(
+        arrivalTime.getTime() - getTotalTravelSeconds(lead) * 1000
+      );
+
+      return {
+        gameName: lead.gameName,
+        launchTime,
+      };
+    })
+    .sort((a, b) => a.launchTime.getTime() - b.launchTime.getTime());
+
+  const longestName = Math.max(...rows.map((r) => r.gameName.length), 4);
+
+  return rows.map((row) => {
+    const paddedName = row.gameName.padEnd(longestName, ' ');
+    return `${paddedName} - ${formatUtcTime(row.launchTime)}`;
+  });
 }
 
 client.once(Events.ClientReady, async () => {
@@ -462,19 +574,23 @@ client.once(Events.ClientReady, async () => {
       leadUserIds: [],
       lastArrivalTime: null,
       lastCalculatedAt: null,
+      lastPlanLines: [],
     }))
   );
-  ensureJsonFile(dashboardStatePath, { dashboardMessageId: null });
+  ensureJsonFile(uiStatePath, {
+    dashboardMessageId: null,
+    launchPlanMessageId: null,
+  });
 
   leads = loadLeadsFromDisk();
   groups = loadGroupsFromDisk();
-  loadDashboardState();
+  loadUiStateFromDisk();
 
-  await refreshDashboardMessage(true);
+  await refreshUi(true);
 
   setInterval(() => {
-    refreshDashboardMessage(false).catch((error) =>
-      console.error('Failed to refresh dashboard on interval', error)
+    refreshUi(false).catch((error) =>
+      console.error('Failed to refresh UI on interval', error)
     );
   }, 1000);
 });
@@ -556,9 +672,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (interaction.customId === 'dashboard:refresh') {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        await refreshDashboardMessage(true);
+        await refreshUi(true);
         await interaction.editReply({
-          content: 'Dashboard refreshed.',
+          content: 'Dashboard and launch plan refreshed.',
         });
         return;
       }
@@ -672,7 +788,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         saveGroupsToDisk();
         sessions.delete(interaction.user.id);
-        await refreshDashboardMessage(true);
+        await refreshUi(true);
 
         const lead = leads.find(
           (l) => l.userId === selectedLeadId || l.manualId === selectedLeadId
@@ -745,39 +861,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
         );
 
         const longestLaunchTime = roundUpToNext15Seconds(rawLongestLaunchTime);
-
         const arrivalTime = new Date(
           longestLaunchTime.getTime() + maxTravelSeconds * 1000
         );
 
         group.lastArrivalTime = arrivalTime.toISOString();
         group.lastCalculatedAt = new Date().toISOString();
-        saveGroupsToDisk();
+        group.lastPlanLines = buildPlanLinesForGroup(arrivalTime, groupLeads);
 
-        const channel = await client.channels.fetch(SVS_CHANNEL_ID);
-        if (!channel || !channel.isTextBased()) {
-          await interaction.followUp({
-            content: 'SvS channel is not available.',
-            flags: MessageFlags.Ephemeral,
-          });
-          return;
+        for (const otherGroup of groups) {
+          if (otherGroup.name !== group.name) {
+            otherGroup.lastCalculatedAt = otherGroup.lastCalculatedAt || null;
+          }
         }
 
-        await channel.send({
-          embeds: [
-            buildLaunchPlanFromOffsetEmbed(
-              group.name,
-              arrivalTime,
-              groupLeads
-            ),
-          ],
-        });
-
+        saveGroupsToDisk();
         sessions.delete(interaction.user.id);
-        await refreshDashboardMessage(true);
+        await refreshUi(true);
 
         await interaction.followUp({
-          content: `Launch plan posted for **${group.name}**.`,
+          content: `Launch plan updated for **${group.name}**.`,
           flags: MessageFlags.Ephemeral,
         });
         return;
@@ -814,7 +917,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           rallySeconds,
         });
 
-        await refreshDashboardMessage(true);
+        await refreshUi(true);
 
         await interaction.editReply({
           content: `Registered **${gameName}** with rally time **${rallySeconds}s**.`,
@@ -854,15 +957,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const safeDiscordUserId = discordUserId || null;
-
         upsertManualLeadInMemory({
           gameName,
           rallySeconds,
-          discordUserId: safeDiscordUserId,
+          discordUserId: discordUserId || null,
         });
 
-        await refreshDashboardMessage(true);
+        await refreshUi(true);
 
         await interaction.editReply({
           content: `Added rally lead **${gameName}** with rally time **${rallySeconds}s**.`,
