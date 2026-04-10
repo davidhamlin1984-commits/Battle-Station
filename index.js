@@ -233,7 +233,7 @@ function buildRallyText(rally) {
 async function refreshDashboardMessage() {
   try {
     const channel = await client.channels.fetch(SVS_CHANNEL_ID);
-    if (!channel || channel.type !== ChannelType.GuildText) {
+    if (!channel || !channel.isTextBased()) {
       return;
     }
 
@@ -265,7 +265,7 @@ async function refreshRallyMessage(rally) {
     if (!rally.messageId) return;
 
     const channel = await client.channels.fetch(SVS_CHANNEL_ID);
-    if (!channel || channel.type !== ChannelType.GuildText) {
+    if (!channel || !channel.isTextBased()) {
       return;
     }
 
@@ -463,7 +463,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         sessions.delete(interaction.user.id);
 
         const channel = await client.channels.fetch(SVS_CHANNEL_ID);
-        if (!channel || channel.type !== ChannelType.GuildText) {
+        if (!channel || !channel.isTextBased()) {
           await interaction.update({
             content: 'SvS channel is not available.',
             components: [],
