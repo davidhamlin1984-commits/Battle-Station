@@ -25,7 +25,6 @@ const RALLY_MANAGER_ROLE_NAME =
   process.env.RALLY_MANAGER_ROLE_NAME || 'Rally Lead';
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 
-// How long to keep a plan visible after its call time has passed
 const PLAN_HIGHLIGHT_SECONDS = 8;
 
 if (!TOKEN || !SVS_CHANNEL_ID) {
@@ -310,20 +309,43 @@ function buildPlanRowsForGroup(arrivalTime, selectedLeads) {
     .sort((a, b) => new Date(a.callTime) - new Date(b.callTime));
 }
 
+function buildCopyTextForGroup(group) {
+  if (!group || !Array.isArray(group.lastPlanRows) || group.lastPlanRows.length === 0) {
+    return `${group?.name || 'Group'}\nNo active plan.`;
+  }
+
+  const now = Date.now();
+  const visibleRows = group.lastPlanRows.filter((row) => {
+    const callTime = new Date(row.callTime).getTime();
+    return (
+      Number.isFinite(callTime) &&
+      now <= callTime + PLAN_HIGHLIGHT_SECONDS * 1000
+    );
+  });
+
+  if (visibleRows.length === 0) {
+    return `${group.name}\nNo active plan.`;
+  }
+
+  return [
+    group.name,
+    ...visibleRows.map((row) => `${row.gameName} - ${formatUtcTime(new Date(row.callTime))}`),
+  ].join('\n');
+}
+
 function buildGroupPlanFieldValue(group) {
   if (!Array.isArray(group.lastPlanRows) || group.lastPlanRows.length === 0) {
     return 'No active plan.';
   }
 
   const now = Date.now();
-  const visibleRows = group.lastPlanRows
-    .filter((row) => {
-      const callTime = new Date(row.callTime).getTime();
-      return (
-        Number.isFinite(callTime) &&
-        now <= callTime + PLAN_HIGHLIGHT_SECONDS * 1000
-      );
-    });
+  const visibleRows = group.lastPlanRows.filter((row) => {
+    const callTime = new Date(row.callTime).getTime();
+    return (
+      Number.isFinite(callTime) &&
+      now <= callTime + PLAN_HIGHLIGHT_SECONDS * 1000
+    );
+  });
 
   if (visibleRows.length === 0) {
     return 'No active plan.';
@@ -466,6 +488,26 @@ function buildDashboardRows() {
         .setCustomId('group:calculate')
         .setLabel('Calculate Launch Times')
         .setStyle(ButtonStyle.Primary)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('copy:ST8 Rally 1')
+        .setLabel('Copy ST8 Rally 1')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('copy:ST8 Rally 2')
+        .setLabel('Copy ST8 Rally 2')
+        .setStyle(ButtonStyle.Secondary)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('copy:ST2 Rally 1')
+        .setLabel('Copy ST2 Rally 1')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('copy:ST2 Rally 2')
+        .setLabel('Copy ST2 Rally 2')
+        .setStyle(ButtonStyle.Secondary)
     ),
   ];
 }
@@ -613,6 +655,17 @@ client.once(Events.ClientReady, async () => {
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith('copy:')) {
+        const groupName = interaction.customId.replace('copy:', '');
+        const group = groups.find((g) => g.name === groupName);
+
+        await interaction.reply({
+          content: `\`\`\`\n${buildCopyTextForGroup(group)}\n\`\`\``,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
       if (interaction.customId === 'lead:register') {
         const modal = new ModalBuilder()
           .setCustomId('lead:register_modal')
@@ -688,9 +741,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.customId === 'dashboard:refresh') {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         await refreshDashboardMessage(true);
-        await interaction.editReply({
-          content: 'Dashboard refreshed.',
-        });
+        await interaction.deleteReply().catch(() => null);
         return;
       }
 
@@ -775,10 +826,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const session = sessions.get(interaction.user.id);
 
         if (!session?.groupName) {
-          await interaction.followUp({
-            content: 'Your session expired. Please start again.',
-            flags: MessageFlags.Ephemeral,
-          });
           return;
         }
 
@@ -790,10 +837,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const targetGroup = groups.find((g) => g.name === session.groupName);
         if (!targetGroup) {
-          await interaction.followUp({
-            content: 'Group not found.',
-            flags: MessageFlags.Ephemeral,
-          });
           return;
         }
 
@@ -804,13 +847,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         saveGroupsToDisk();
         sessions.delete(interaction.user.id);
         await refreshDashboardMessage(true);
-
-        const lead = getLeadByStoredId(selectedLeadId);
-
-        await interaction.followUp({
-          content: `Assigned **${lead?.gameName || selectedLeadId}** to **${targetGroup.name}**.`,
-          flags: MessageFlags.Ephemeral,
-        });
         return;
       }
 
@@ -832,10 +868,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const session = sessions.get(interaction.user.id);
         if (!session?.groupName) {
-          await interaction.followUp({
-            content: 'Your session expired. Please start again.',
-            flags: MessageFlags.Ephemeral,
-          });
           return;
         }
 
@@ -843,10 +875,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const group = groups.find((g) => g.name === session.groupName);
 
         if (!group) {
-          await interaction.followUp({
-            content: 'Group not found.',
-            flags: MessageFlags.Ephemeral,
-          });
           return;
         }
 
@@ -855,10 +883,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .filter(Boolean);
 
         if (groupLeads.length === 0) {
-          await interaction.followUp({
-            content: 'That group has no rally leads assigned.',
-            flags: MessageFlags.Ephemeral,
-          });
           return;
         }
 
@@ -883,11 +907,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         saveGroupsToDisk();
         sessions.delete(interaction.user.id);
         await refreshDashboardMessage(true);
-
-        await interaction.followUp({
-          content: `Launch plan updated for **${group.name}**.`,
-          flags: MessageFlags.Ephemeral,
-        });
         return;
       }
     }
@@ -923,10 +942,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
 
         await refreshDashboardMessage(true);
-
-        await interaction.editReply({
-          content: `Registered **${gameName}** with rally time **${rallySeconds}s**.`,
-        });
+        await interaction.deleteReply().catch(() => null);
         return;
       }
 
@@ -969,10 +985,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
 
         await refreshDashboardMessage(true);
-
-        await interaction.editReply({
-          content: `Added rally lead **${gameName}** with rally time **${rallySeconds}s**.`,
-        });
+        await interaction.deleteReply().catch(() => null);
         return;
       }
     }
@@ -980,15 +993,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
     console.error('Interaction error', error);
 
     if (interaction.deferred || interaction.replied) {
-      await interaction.followUp({
-        content: 'Something went wrong.',
-        flags: MessageFlags.Ephemeral,
-      }).catch(() => null);
+      await interaction
+        .followUp({
+          content: 'Something went wrong.',
+          flags: MessageFlags.Ephemeral,
+        })
+        .catch(() => null);
     } else {
-      await interaction.reply({
-        content: 'Something went wrong.',
-        flags: MessageFlags.Ephemeral,
-      }).catch(() => null);
+      await interaction
+        .reply({
+          content: 'Something went wrong.',
+          flags: MessageFlags.Ephemeral,
+        })
+        .catch(() => null);
     }
   }
 });
