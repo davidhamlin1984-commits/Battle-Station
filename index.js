@@ -5,7 +5,6 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  ChannelType,
   Client,
   EmbedBuilder,
   Events,
@@ -31,7 +30,6 @@ const client = new Client({
 });
 
 const sessions = new Map();
-
 const ralliesPath = path.join(DATA_DIR, 'svs_rallies.json');
 
 function ensureDataDir() {
@@ -98,13 +96,6 @@ function activeRallies() {
   return rallies.filter((r) => r.active);
 }
 
-function getAllianceOptions() {
-  return [
-    { label: 'ZRH', value: 'ZRH' },
-    { label: 'VIK', value: 'VIK' },
-  ];
-}
-
 function buildDashboardEmbed() {
   const rallies = activeRallies();
 
@@ -132,22 +123,22 @@ function buildDashboardEmbed() {
 }
 
 function buildDashboardRows() {
-  const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('dashboard:create_rally')
-      .setLabel('Create SvS Rally')
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId('dashboard:view_rallies')
-      .setLabel('View Active Rallies')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId('dashboard:refresh')
-      .setLabel('Refresh Dashboard')
-      .setStyle(ButtonStyle.Secondary)
-  );
-
-  return [row1];
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('dashboard:create_rally')
+        .setLabel('Create SvS Rally')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId('dashboard:view_rallies')
+        .setLabel('View Active Rallies')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('dashboard:refresh')
+        .setLabel('Refresh Dashboard')
+        .setStyle(ButtonStyle.Secondary)
+    ),
+  ];
 }
 
 function buildAllianceSelect() {
@@ -155,7 +146,10 @@ function buildAllianceSelect() {
     new StringSelectMenuBuilder()
       .setCustomId('rally:alliance')
       .setPlaceholder('Select alliance')
-      .addOptions(getAllianceOptions())
+      .addOptions(
+        { label: 'ZRH', value: 'ZRH' },
+        { label: 'VIK', value: 'VIK' }
+      )
   );
 }
 
@@ -233,9 +227,13 @@ function buildRallyText(rally) {
 async function refreshDashboardMessage() {
   try {
     const channel = await client.channels.fetch(SVS_CHANNEL_ID);
+
     if (!channel || !channel.isTextBased()) {
+      console.error('SVS channel is not text-based or not found.');
       return;
     }
+
+    console.log('SVS channel type:', channel.type, 'textBased:', channel.isTextBased());
 
     const recent = await channel.messages.fetch({ limit: 20 });
     const existing = recent.find(
@@ -360,7 +358,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
             .slice(0, 3500);
 
           await interaction.reply({
-            embeds: [new EmbedBuilder().setTitle('Active Rallies').setDescription(text)],
+            embeds: [
+              new EmbedBuilder()
+                .setTitle('Active Rallies')
+                .setDescription(text),
+            ],
             flags: MessageFlags.Ephemeral,
           });
           return;
@@ -496,15 +498,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
     console.error('Interaction error', error);
 
     if (interaction.deferred || interaction.replied) {
-      await interaction.followUp({
-        content: 'Something went wrong.',
-        flags: MessageFlags.Ephemeral,
-      }).catch(() => null);
+      await interaction
+        .followUp({
+          content: 'Something went wrong.',
+          flags: MessageFlags.Ephemeral,
+        })
+        .catch(() => null);
     } else {
-      await interaction.reply({
-        content: 'Something went wrong.',
-        flags: MessageFlags.Ephemeral,
-      }).catch(() => null);
+      await interaction
+        .reply({
+          content: 'Something went wrong.',
+          flags: MessageFlags.Ephemeral,
+        })
+        .catch(() => null);
     }
   }
 });
