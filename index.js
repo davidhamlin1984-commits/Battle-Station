@@ -198,6 +198,7 @@ function upsertLeadInMemory({ userId, discordName, gameName, rallySeconds }) {
     existing.discordName = discordName;
     existing.gameName = gameName;
     existing.rallySeconds = rallySeconds;
+    existing.source = 'self';
     existing.updatedAt = new Date().toISOString();
   } else {
     leads.push({
@@ -205,6 +206,41 @@ function upsertLeadInMemory({ userId, discordName, gameName, rallySeconds }) {
       discordName,
       gameName,
       rallySeconds,
+      source: 'self',
+      manualId: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  saveLeadsToDisk();
+}
+
+function upsertManualLeadInMemory({ gameName, rallySeconds, discordUserId }) {
+  const normalizedGameName = gameName.trim().toLowerCase();
+
+  const existing = leads.find(
+    (l) =>
+      (discordUserId && l.userId && l.userId === discordUserId) ||
+      l.gameName.trim().toLowerCase() === normalizedGameName
+  );
+
+  if (existing) {
+    existing.userId = discordUserId || existing.userId || null;
+    existing.gameName = gameName;
+    existing.rallySeconds = rallySeconds;
+    existing.source = 'manual';
+    existing.updatedAt = new Date().toISOString();
+  } else {
+    leads.push({
+      userId: discordUserId || null,
+      discordName: null,
+      gameName,
+      rallySeconds,
+      source: 'manual',
+      manualId: `manual_${Date.now()}_${Math.random()
+        .toString(36)
+        .slice(2, 6)}`,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     });
@@ -221,10 +257,11 @@ function buildDashboardDescription() {
       ? 'No rally leads registered yet.'
       : leads
           .slice(0, 15)
-          .map(
-            (lead, i) =>
-              `**${i + 1}. ${lead.gameName}** - ${lead.rallySeconds}s - <@${lead.userId}>`
-          )
+          .map((lead, i) => {
+            const mention = lead.userId ? ` - <@${lead.userId}>` : '';
+            const source = lead.source === 'manual' ? ' [manual]' : '';
+            return `**${i + 1}. ${lead.gameName}** - ${lead.rallySeconds}s${mention}${source}`;
+          })
           .join('\n');
 
   const groupText = groups
@@ -234,8 +271,8 @@ function buildDashboardDescription() {
           ? 'None'
           : group.leadUserIds
               .map((id) => {
-                const lead = leads.find((l) => l.userId === id);
-                return lead ? `${lead.gameName}` : `<@${id}>`;
+                const lead = leads.find((l) => l.userId === id || l.manualId === id);
+                return lead ? `${lead.gameName}` : id;
               })
               .join(', ');
 
@@ -258,12 +295,6 @@ function buildDashboardDescription() {
   return [`**Rally Leads**`, leadText, '', `**Groups**`, groupText].join('\n');
 }
 
-function buildDashboardEmbed() {
-  return new EmbedBuilder()
-    .setTitle('SvS Rally Lead Dashboard')
-    .setDescription(buildDashboardDescription());
-}
-
 function buildDashboardRows() {
   return [
     new ActionRowBuilder().addComponents(
@@ -271,6 +302,10 @@ function buildDashboardRows() {
         .setCustomId('lead:register')
         .setLabel('Become Rally Lead')
         .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId('lead:add_manual')
+        .setLabel('Add Rally Lead')
+        .setStyle(ButtonStyle.Success),
       new ButtonBuilder()
         .setCustomId('dashboard:refresh')
         .setLabel('Refresh Dashboard')
@@ -315,8 +350,11 @@ function buildLeadSelect(customId) {
       .addOptions(
         leads.slice(0, 25).map((lead) => ({
           label: `${lead.gameName} (${lead.rallySeconds}s)`.slice(0, 100),
-          value: lead.userId,
-          description: (lead.discordName || `User ${lead.userId}`).slice(0, 100),
+          value: lead.userId || lead.manualId,
+          description: (
+            lead.discordName ||
+            (lead.userId ? `User ${lead.userId}` : 'Manual lead')
+          ).slice(0, 100),
         }))
       )
   );
@@ -387,7 +425,6 @@ async function refreshDashboardMessage(force = false) {
     const description = buildDashboardDescription();
     const nextHash = JSON.stringify({
       description,
-      rows: 2,
       dashboardMessageId,
     });
 
@@ -396,7 +433,11 @@ async function refreshDashboardMessage(force = false) {
     }
 
     const payload = {
-      embeds: [new EmbedBuilder().setTitle('SvS Rally Lead Dashboard').setDescription(description)],
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('SvS Rally Lead Dashboard')
+          .setDescription(description),
+      ],
       components: buildDashboardRows(),
     };
 
@@ -479,6 +520,50 @@ client.on(Events.InteractionCreate, async (interaction) => {
         modal.addComponents(
           new ActionRowBuilder().addComponents(gameNameInput),
           new ActionRowBuilder().addComponents(rallySecondsInput)
+        );
+
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (interaction.customId === 'lead:add_manual') {
+        if (!hasManagerAccess(interaction.member)) {
+          await interaction.reply({
+            content: `You need the **${RALLY_MANAGER_ROLE_NAME}** role to use this.`,
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        const modal = new ModalBuilder()
+          .setCustomId('lead:add_manual_modal')
+          .setTitle('Add Rally Lead');
+
+        const gameNameInput = new TextInputBuilder()
+          .setCustomId('game_name')
+          .setLabel('Game Name')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder('UNb');
+
+        const rallySecondsInput = new TextInputBuilder()
+          .setCustomId('rally_seconds')
+          .setLabel('Rally Time (seconds)')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder('40');
+
+        const discordIdInput = new TextInputBuilder()
+          .setCustomId('discord_user_id')
+          .setLabel('Discord User ID (optional)')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false)
+          .setPlaceholder('123456789012345678');
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(gameNameInput),
+          new ActionRowBuilder().addComponents(rallySecondsInput),
+          new ActionRowBuilder().addComponents(discordIdInput)
         );
 
         await interaction.showModal(modal);
@@ -571,7 +656,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.customId === 'group:assign_select_lead') {
         await interaction.deferUpdate();
 
-        const userId = interaction.values[0];
+        const selectedLeadId = interaction.values[0];
         const session = sessions.get(interaction.user.id);
 
         if (!session?.groupName) {
@@ -583,7 +668,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         for (const group of groups) {
-          group.leadUserIds = group.leadUserIds.filter((id) => id !== userId);
+          group.leadUserIds = group.leadUserIds.filter(
+            (id) => id !== selectedLeadId
+          );
         }
 
         const targetGroup = groups.find((g) => g.name === session.groupName);
@@ -595,18 +682,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (!targetGroup.leadUserIds.includes(userId)) {
-          targetGroup.leadUserIds.push(userId);
+        if (!targetGroup.leadUserIds.includes(selectedLeadId)) {
+          targetGroup.leadUserIds.push(selectedLeadId);
         }
 
         saveGroupsToDisk();
         sessions.delete(interaction.user.id);
         await refreshDashboardMessage(true);
 
-        const lead = leads.find((l) => l.userId === userId);
+        const lead = leads.find(
+          (l) => l.userId === selectedLeadId || l.manualId === selectedLeadId
+        );
 
         await interaction.followUp({
-          content: `Assigned **${lead?.gameName || userId}** to **${targetGroup.name}**.`,
+          content: `Assigned **${lead?.gameName || selectedLeadId}** to **${targetGroup.name}**.`,
           flags: MessageFlags.Ephemeral,
         });
         return;
@@ -649,7 +738,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         const groupLeads = group.leadUserIds
-          .map((id) => leads.find((lead) => lead.userId === id))
+          .map((id) =>
+            leads.find((lead) => lead.userId === id || lead.manualId === id)
+          )
           .filter(Boolean);
 
         if (groupLeads.length === 0) {
@@ -745,6 +836,54 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         await interaction.editReply({
           content: `Registered **${gameName}** with rally time **${rallySeconds}s**.`,
+        });
+        return;
+      }
+
+      if (interaction.customId === 'lead:add_manual_modal') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+        if (!hasManagerAccess(interaction.member)) {
+          await interaction.editReply({
+            content: `You need the **${RALLY_MANAGER_ROLE_NAME}** role to use this.`,
+          });
+          return;
+        }
+
+        const gameName = interaction.fields.getTextInputValue('game_name').trim();
+        const rallySeconds = Number(
+          interaction.fields.getTextInputValue('rally_seconds').trim()
+        );
+        const discordUserId = interaction.fields
+          .getTextInputValue('discord_user_id')
+          .trim();
+
+        if (!gameName) {
+          await interaction.editReply({
+            content: 'Game Name is required.',
+          });
+          return;
+        }
+
+        if (!Number.isFinite(rallySeconds) || rallySeconds <= 0) {
+          await interaction.editReply({
+            content: 'Rally Time must be a valid number greater than 0.',
+          });
+          return;
+        }
+
+        const safeDiscordUserId = discordUserId || null;
+
+        upsertManualLeadInMemory({
+          gameName,
+          rallySeconds,
+          discordUserId: safeDiscordUserId,
+        });
+
+        await refreshDashboardMessage(true);
+
+        await interaction.editReply({
+          content: `Added rally lead **${gameName}** with rally time **${rallySeconds}s**.`,
         });
         return;
       }
