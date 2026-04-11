@@ -279,7 +279,10 @@ function clearExpiredPlans() {
       ? new Date(group.lastArrivalTime).getTime()
       : NaN;
 
-    if (Number.isFinite(latestArrival) && now > latestArrival + PLAN_HIGHLIGHT_SECONDS * 1000) {
+    if (
+      Number.isFinite(latestArrival) &&
+      now > latestArrival + PLAN_HIGHLIGHT_SECONDS * 1000
+    ) {
       group.lastArrivalTime = null;
       group.lastCalculatedAt = null;
       group.lastPlanRows = [];
@@ -308,7 +311,11 @@ function buildPlanRowsForGroup(arrivalTime, selectedLeads) {
 }
 
 function buildCopyTextForGroup(group) {
-  if (!group || !Array.isArray(group.lastPlanRows) || group.lastPlanRows.length === 0) {
+  if (
+    !group ||
+    !Array.isArray(group.lastPlanRows) ||
+    group.lastPlanRows.length === 0
+  ) {
     return `${group?.name || 'Group'}\nNo active plan.`;
   }
 
@@ -327,7 +334,9 @@ function buildCopyTextForGroup(group) {
 
   return [
     group.name,
-    ...visibleRows.map((row) => `${row.gameName} - ${formatUtcTime(new Date(row.callTime))}`),
+    ...visibleRows.map(
+      (row) => `${row.gameName} - ${formatUtcTime(new Date(row.callTime))}`
+    ),
   ].join('\n');
 }
 
@@ -355,12 +364,12 @@ function buildGroupPlanFieldValue(group) {
       const callDate = new Date(row.callTime);
       const diff = callDate.getTime() - now;
 
-      // BEFORE send → countdown
       if (diff > 0) {
-        return `${row.gameName} - ${formatUtcTime(callDate)} (${formatCountdownMs(diff)})`;
+        return `${row.gameName} - ${formatUtcTime(callDate)} (${formatCountdownMs(
+          diff
+        )})`;
       }
 
-      // EXACT send moment → SEND NOW
       return `🟨 **SEND NOW** ${row.gameName} - ${formatUtcTime(callDate)}`;
     })
     .join('\n');
@@ -402,9 +411,11 @@ function buildDashboardDescription() {
           const landDiff = landDate.getTime() - now;
 
           if (landDiff > 0) {
-            suffix = ` —  ${formatUtcTime(landDate)} — ${formatCountdownMs(landDiff)}`;
+            suffix = ` — 🎯 ${formatUtcTime(landDate)} — ${formatCountdownMs(
+              landDiff
+            )}`;
           } else {
-            suffix = ` —  ${formatUtcTime(landDate)} — LANDED`;
+            suffix = ` — 🎯 ${formatUtcTime(landDate)} — LANDED`;
           }
         }
       }
@@ -414,10 +425,10 @@ function buildDashboardDescription() {
     .join('\n');
 
   return [
-    '**Rally Leads**',
+    '**👤 Rally Leads**',
     leadText,
     '',
-    '**Groups**',
+    '**🧩 Groups**',
     groupText,
   ].join('\n');
 }
@@ -429,14 +440,14 @@ function buildDashboardEmbed() {
 
   embed.addFields(
     {
-      name: 'ST8 Rally 1',
+      name: '📨 ST8 Rally 1',
       value: buildGroupPlanFieldValue(
         groups.find((g) => g.name === 'ST8 Rally 1') || { lastPlanRows: [] }
       ),
       inline: true,
     },
     {
-      name: 'ST8 Rally 2',
+      name: '📨 ST8 Rally 2',
       value: buildGroupPlanFieldValue(
         groups.find((g) => g.name === 'ST8 Rally 2') || { lastPlanRows: [] }
       ),
@@ -448,14 +459,14 @@ function buildDashboardEmbed() {
       inline: true,
     },
     {
-      name: 'ST2 Rally 1',
+      name: '📨 ST2 Rally 1',
       value: buildGroupPlanFieldValue(
         groups.find((g) => g.name === 'ST2 Rally 1') || { lastPlanRows: [] }
       ),
       inline: true,
     },
     {
-      name: 'ST2 Rally 2',
+      name: '📨 ST2 Rally 2',
       value: buildGroupPlanFieldValue(
         groups.find((g) => g.name === 'ST2 Rally 2') || { lastPlanRows: [] }
       ),
@@ -483,9 +494,9 @@ function buildDashboardRows() {
         .setLabel('Add Rally Lead')
         .setStyle(ButtonStyle.Success),
       new ButtonBuilder()
-        .setCustomId('dashboard:refresh')
-        .setLabel('Refresh Dashboard')
-        .setStyle(ButtonStyle.Secondary)
+        .setCustomId('group:cancel')
+        .setLabel('Cancel Rally')
+        .setStyle(ButtonStyle.Danger)
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
@@ -570,6 +581,36 @@ function buildLaunchOffsetSelect() {
   );
 }
 
+function buildRunningRallySelect(customId) {
+  const now = Date.now();
+
+  const runningGroups = groups.filter((group) => {
+    if (!group.lastArrivalTime) return false;
+
+    const arrival = new Date(group.lastArrivalTime).getTime();
+    return (
+      Number.isFinite(arrival) &&
+      now <= arrival + PLAN_HIGHLIGHT_SECONDS * 1000
+    );
+  });
+
+  if (runningGroups.length === 0) {
+    return null;
+  }
+
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(customId)
+      .setPlaceholder('Select a running rally')
+      .addOptions(
+        runningGroups.map((group) => ({
+          label: group.name,
+          value: group.name,
+        }))
+      )
+  );
+}
+
 async function getTextChannel() {
   const channel = await client.channels.fetch(SVS_CHANNEL_ID);
   if (!channel || !channel.isTextBased()) {
@@ -632,10 +673,12 @@ async function refreshDashboardMessage(force = false) {
 async function closeEphemeralFlow(interaction) {
   try {
     if (interaction.isStringSelectMenu()) {
-      await interaction.update({
-        content: 'Done.',
-        components: [],
-      }).catch(() => null);
+      await interaction
+        .update({
+          content: 'Done.',
+          components: [],
+        })
+        .catch(() => null);
       setTimeout(() => {
         interaction.deleteReply().catch(() => null);
       }, 300);
@@ -767,10 +810,32 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      if (interaction.customId === 'dashboard:refresh') {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        await refreshDashboardMessage(true);
-        await interaction.deleteReply().catch(() => null);
+      if (interaction.customId === 'group:cancel') {
+        if (!hasManagerAccess(interaction.member)) {
+          await interaction.reply({
+            content: `You need the **${RALLY_MANAGER_ROLE_NAME}** role to use this.`,
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        const runningSelect = buildRunningRallySelect(
+          'group:cancel_select_group'
+        );
+
+        if (!runningSelect) {
+          await interaction.reply({
+            content: 'There are no running rallies to cancel.',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        await interaction.reply({
+          content: 'Select a running rally to cancel.',
+          components: [runningSelect],
+          flags: MessageFlags.Ephemeral,
+        });
         return;
       }
 
@@ -815,7 +880,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         interaction.customId === 'group:assign_select_group' ||
         interaction.customId === 'group:calculate_select_group' ||
         interaction.customId === 'group:assign_select_lead' ||
-        interaction.customId === 'group:calculate_select_offset'
+        interaction.customId === 'group:calculate_select_offset' ||
+        interaction.customId === 'group:cancel_select_group'
       ) {
         if (!hasManagerAccess(interaction.member)) {
           await interaction.reply({
@@ -824,6 +890,33 @@ client.on(Events.InteractionCreate, async (interaction) => {
           });
           return;
         }
+      }
+
+      if (interaction.customId === 'group:cancel_select_group') {
+        const groupName = interaction.values[0];
+        const group = groups.find((g) => g.name === groupName);
+
+        if (!group) {
+          await interaction
+            .update({
+              content: 'Group not found.',
+              components: [],
+            })
+            .catch(() => null);
+          setTimeout(() => {
+            interaction.deleteReply().catch(() => null);
+          }, 300);
+          return;
+        }
+
+        group.lastArrivalTime = null;
+        group.lastCalculatedAt = null;
+        group.lastPlanRows = [];
+
+        saveGroupsToDisk();
+        await refreshDashboardMessage(true);
+        await closeEphemeralFlow(interaction);
+        return;
       }
 
       if (interaction.customId === 'group:assign_select_group') {
@@ -856,10 +949,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const session = sessions.get(interaction.user.id);
 
         if (!session?.groupName) {
-          await interaction.update({
-            content: 'Session expired.',
-            components: [],
-          }).catch(() => null);
+          await interaction
+            .update({
+              content: 'Session expired.',
+              components: [],
+            })
+            .catch(() => null);
           setTimeout(() => {
             interaction.deleteReply().catch(() => null);
           }, 300);
@@ -874,10 +969,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const targetGroup = groups.find((g) => g.name === session.groupName);
         if (!targetGroup) {
-          await interaction.update({
-            content: 'Group not found.',
-            components: [],
-          }).catch(() => null);
+          await interaction
+            .update({
+              content: 'Group not found.',
+              components: [],
+            })
+            .catch(() => null);
           setTimeout(() => {
             interaction.deleteReply().catch(() => null);
           }, 300);
@@ -911,10 +1008,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.customId === 'group:calculate_select_offset') {
         const session = sessions.get(interaction.user.id);
         if (!session?.groupName) {
-          await interaction.update({
-            content: 'Session expired.',
-            components: [],
-          }).catch(() => null);
+          await interaction
+            .update({
+              content: 'Session expired.',
+              components: [],
+            })
+            .catch(() => null);
           setTimeout(() => {
             interaction.deleteReply().catch(() => null);
           }, 300);
@@ -925,10 +1024,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const group = groups.find((g) => g.name === session.groupName);
 
         if (!group) {
-          await interaction.update({
-            content: 'Group not found.',
-            components: [],
-          }).catch(() => null);
+          await interaction
+            .update({
+              content: 'Group not found.',
+              components: [],
+            })
+            .catch(() => null);
           setTimeout(() => {
             interaction.deleteReply().catch(() => null);
           }, 300);
@@ -940,10 +1041,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .filter(Boolean);
 
         if (groupLeads.length === 0) {
-          await interaction.update({
-            content: 'That group has no rally leads assigned.',
-            components: [],
-          }).catch(() => null);
+          await interaction
+            .update({
+              content: 'That group has no rally leads assigned.',
+              components: [],
+            })
+            .catch(() => null);
           setTimeout(() => {
             interaction.deleteReply().catch(() => null);
           }, 300);
@@ -1001,7 +1104,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         upsertLeadInMemory({
           userId: interaction.user.id,
-          discordName: interaction.member?.displayName || interaction.user.username,
+          discordName:
+            interaction.member?.displayName || interaction.user.username,
           gameName,
           rallySeconds,
         });
