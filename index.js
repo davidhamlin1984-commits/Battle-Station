@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
+const https = require('https');
 const {
   ActionRowBuilder,
   ButtonBuilder,
@@ -15,26 +16,38 @@ const {
   TextInputStyle,
   MessageFlags,
   InteractionType,
+  ChannelType,
 } = require('discord.js');
+const {
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
+  entersState,
+  VoiceConnectionStatus,
+} = require('@discordjs/voice');
+const prism = require('prism-media');
+const googleTTS = require('google-tts-api');
 
 dotenv.config();
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const SVS_CHANNEL_ID = process.env.SVS_CHANNEL_ID;
+const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
+const GUILD_ID = process.env.GUILD_ID;
 const RALLY_MANAGER_ROLE_NAME =
   process.env.RALLY_MANAGER_ROLE_NAME || 'Rally Lead';
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 
-// How long a send-time stays visible after its call time passes
 const PLAN_HIGHLIGHT_SECONDS = 8;
 
-if (!TOKEN || !SVS_CHANNEL_ID) {
+if (!TOKEN || !SVS_CHANNEL_ID || !VOICE_CHANNEL_ID || !GUILD_ID) {
   console.error('Missing required environment variables.');
   process.exit(1);
 }
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
 const sessions = new Map();
@@ -58,6 +71,12 @@ let uiState = {
 
 let refreshInFlight = false;
 let lastDashboardHash = '';
+
+let voiceConnection = null;
+let audioPlayer = null;
+let isSpeaking = false;
+const speechQueue = [];
+const announcedCallTimes = new Set();
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -179,10 +198,6 @@ function formatCountdownMs(ms) {
     2,
     '0'
   )}`;
-}
-
-function formatCountdownToDate(date) {
-  return formatCountdownMs(date.getTime() - Date.now());
 }
 
 function roundUpToNext15Seconds(date) {
@@ -619,6 +634,138 @@ async function getTextChannel() {
   return channel;
 }
 
+async function ensureVoiceConnection() {
+  if (
+    voiceConnection &&
+    voiceConnection.state.status !== VoiceConnectionStatus.Destroyed
+  ) {
+    return voiceConnection;
+  }
+
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const channel = await guild.channels.fetch(VOICE_CHANNEL_ID);
+
+  if (
+    !channel ||
+    (channel.type !== ChannelType.GuildVoice &&
+      channel.type !== ChannelType.GuildStageVoice)
+  ) {
+    throw new Error('Voice channel not found or is not a voice/stage channel.');
+  }
+
+  voiceConnection = joinVoiceChannel({
+    channelId: channel.id,
+    guildId: guild.id,
+    adapterCreator: guild.voiceAdapterCreator,
+    selfDeaf: false,
+    selfMute: false,
+  });
+
+  await entersState(voiceConnection, VoiceConnectionStatus.Ready, 15000);
+
+  if (!audioPlayer) {
+    audioPlayer = createAudioPlayer();
+  }
+
+  voiceConnection.subscribe(audioPlayer);
+  return voiceConnection;
+}
+
+function createTtsResource(text) {
+  return new Promise((resolve, reject) => {
+    try {
+      const url = googleTTS.getAudioUrl(text, {
+        lang: 'en',
+        slow: false,
+        host: 'https://translate.google.com',
+      });
+
+      https
+        .get(url, (res) => {
+          const transcoder = new prism.FFmpeg({
+            args: [
+              '-analyzeduration',
+              '0',
+              '-loglevel',
+              '0',
+              '-i',
+              'pipe:0',
+              '-f',
+              's16le',
+              '-ar',
+              '48000',
+              '-ac',
+              '2',
+              'pipe:1',
+            ],
+          });
+
+          res.pipe(transcoder);
+
+          const resource = createAudioResource(transcoder);
+          resolve(resource);
+        })
+        .on('error', reject);
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+async function speakText(text) {
+  speechQueue.push(text);
+
+  if (isSpeaking) return;
+
+  isSpeaking = true;
+
+  try {
+    await ensureVoiceConnection();
+
+    while (speechQueue.length > 0) {
+      const nextText = speechQueue.shift();
+      const resource = await createTtsResource(nextText);
+
+      audioPlayer.play(resource);
+      await entersState(audioPlayer, AudioPlayerStatus.Playing, 10000);
+      await entersState(audioPlayer, AudioPlayerStatus.Idle, 30000);
+    }
+  } catch (error) {
+    console.error('Voice speech error', error);
+  } finally {
+    isSpeaking = false;
+  }
+}
+
+async function processVoiceAnnouncements() {
+  const now = Date.now();
+
+  for (const group of groups) {
+    if (!Array.isArray(group.lastPlanRows) || group.lastPlanRows.length === 0) {
+      continue;
+    }
+
+    for (const row of group.lastPlanRows) {
+      const callTime = new Date(row.callTime).getTime();
+
+      if (!Number.isFinite(callTime)) {
+        continue;
+      }
+
+      const announceKey = `${group.name}:${row.gameName}:${row.callTime}`;
+
+      if (now >= callTime && !announcedCallTimes.has(announceKey)) {
+        announcedCallTimes.add(announceKey);
+        await speakText(`${group.name}. ${row.gameName}, send now.`);
+      }
+
+      if (now > callTime + 60000 && announcedCallTimes.has(announceKey)) {
+        announcedCallTimes.delete(announceKey);
+      }
+    }
+  }
+}
+
 async function refreshDashboardMessage(force = false) {
   if (refreshInFlight) return;
   refreshInFlight = true;
@@ -649,7 +796,7 @@ async function refreshDashboardMessage(force = false) {
     if (uiState.dashboardMessageId) {
       try {
         msg = await channel.messages.fetch(uiState.dashboardMessageId);
-      } catch (error) {
+      } catch {
         msg = null;
       }
     }
@@ -688,7 +835,7 @@ async function closeEphemeralFlow(interaction) {
     if (interaction.deferred || interaction.replied) {
       await interaction.deleteReply().catch(() => null);
     }
-  } catch (error) {
+  } catch {
     // ignore
   }
 }
@@ -717,11 +864,24 @@ client.once(Events.ClientReady, async () => {
 
   await refreshDashboardMessage(true);
 
+  await ensureVoiceConnection().catch((error) =>
+    console.error('Failed to connect to voice on startup', error)
+  );
+
+  // Optional startup voice test:
+  // await speakText('Voice system online');
+
   setInterval(() => {
     refreshDashboardMessage(false).catch((error) =>
       console.error('Failed to refresh dashboard on interval', error)
     );
   }, 500);
+
+  setInterval(() => {
+    processVoiceAnnouncements().catch((error) =>
+      console.error('Failed to process voice announcements', error)
+    );
+  }, 250);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
