@@ -42,7 +42,12 @@ const DATA_DIR = process.env.DATA_DIR || __dirname;
 const PLAN_HIGHLIGHT_SECONDS = 8;
 
 if (!TOKEN || !SVS_CHANNEL_ID || !VOICE_CHANNEL_ID || !GUILD_ID) {
-  console.error('Missing required environment variables.');
+  console.error('Missing required environment variables:', {
+    DISCORD_TOKEN: !!TOKEN,
+    SVS_CHANNEL_ID: !!SVS_CHANNEL_ID,
+    VOICE_CHANNEL_ID: !!VOICE_CHANNEL_ID,
+    GUILD_ID: !!GUILD_ID,
+  });
   process.exit(1);
 }
 
@@ -77,6 +82,7 @@ let audioPlayer = null;
 let isSpeaking = false;
 const speechQueue = [];
 const announcedCallTimes = new Set();
+const warnedCallTimes = new Set();
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -637,7 +643,8 @@ async function getTextChannel() {
 async function ensureVoiceConnection() {
   if (
     voiceConnection &&
-    voiceConnection.state.status !== VoiceConnectionStatus.Destroyed
+    voiceConnection.state.status !== VoiceConnectionStatus.Destroyed &&
+    voiceConnection.state.status !== VoiceConnectionStatus.Disconnected
   ) {
     return voiceConnection;
   }
@@ -661,10 +668,20 @@ async function ensureVoiceConnection() {
     selfMute: false,
   });
 
-  await entersState(voiceConnection, VoiceConnectionStatus.Ready, 15000);
+  voiceConnection.on('stateChange', (oldState, newState) => {
+    console.log(`Voice connection state: ${oldState.status} -> ${newState.status}`);
+  });
+
+  await entersState(voiceConnection, VoiceConnectionStatus.Ready, 30000);
 
   if (!audioPlayer) {
     audioPlayer = createAudioPlayer();
+    audioPlayer.on('stateChange', (oldState, newState) => {
+      console.log(`Audio player state: ${oldState.status} -> ${newState.status}`);
+    });
+    audioPlayer.on('error', (error) => {
+      console.error('Audio player error', error);
+    });
   }
 
   voiceConnection.subscribe(audioPlayer);
@@ -700,6 +717,8 @@ function createTtsResource(text) {
             ],
           });
 
+          transcoder.on('error', reject);
+          res.on('error', reject);
           res.pipe(transcoder);
 
           const resource = createAudioResource(transcoder);
@@ -720,13 +739,15 @@ async function speakText(text) {
   isSpeaking = true;
 
   try {
-    await ensureVoiceConnection();
-
     while (speechQueue.length > 0) {
-      const nextText = speechQueue.shift();
-      const resource = await createTtsResource(nextText);
+      await ensureVoiceConnection();
 
+      const nextText = speechQueue.shift();
+      console.log('Speaking:', nextText);
+
+      const resource = await createTtsResource(nextText);
       audioPlayer.play(resource);
+
       await entersState(audioPlayer, AudioPlayerStatus.Playing, 10000);
       await entersState(audioPlayer, AudioPlayerStatus.Idle, 30000);
     }
@@ -753,13 +774,24 @@ async function processVoiceAnnouncements() {
       }
 
       const announceKey = `${group.name}:${row.gameName}:${row.callTime}`;
+      const warnKey = `warn:${announceKey}`;
+
+      if (
+        now >= callTime - 10000 &&
+        now < callTime &&
+        !warnedCallTimes.has(warnKey)
+      ) {
+        warnedCallTimes.add(warnKey);
+        await speakText(`${row.gameName}, get ready.`);
+      }
 
       if (now >= callTime && !announcedCallTimes.has(announceKey)) {
         announcedCallTimes.add(announceKey);
         await speakText(`${group.name}. ${row.gameName}, send now.`);
       }
 
-      if (now > callTime + 60000 && announcedCallTimes.has(announceKey)) {
+      if (now > callTime + 60000) {
+        warnedCallTimes.delete(warnKey);
         announcedCallTimes.delete(announceKey);
       }
     }
@@ -864,13 +896,6 @@ client.once(Events.ClientReady, async () => {
 
   await refreshDashboardMessage(true);
 
-  await ensureVoiceConnection().catch((error) =>
-    console.error('Failed to connect to voice on startup', error)
-  );
-
-  // Optional startup voice test:
-  // await speakText('Voice system online');
-
   setInterval(() => {
     refreshDashboardMessage(false).catch((error) =>
       console.error('Failed to refresh dashboard on interval', error)
@@ -882,6 +907,12 @@ client.once(Events.ClientReady, async () => {
       console.error('Failed to process voice announcements', error)
     );
   }, 250);
+
+  setTimeout(() => {
+    speakText('Battle Station online').catch((error) =>
+      console.error('Startup speech test failed', error)
+    );
+  }, 10000);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
