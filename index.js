@@ -650,14 +650,6 @@ async function getTextChannel() {
 }
 
 async function ensureVoiceConnection() {
-  if (
-    voiceConnection &&
-    voiceConnection.state.status !== VoiceConnectionStatus.Destroyed &&
-    voiceConnection.state.status !== VoiceConnectionStatus.Disconnected
-  ) {
-    return voiceConnection;
-  }
-
   const guild = await client.guilds.fetch(GUILD_ID);
   const channel = await guild.channels.fetch(VOICE_CHANNEL_ID);
 
@@ -668,24 +660,6 @@ async function ensureVoiceConnection() {
   ) {
     throw new Error('Voice channel not found or is not a voice/stage channel.');
   }
-
-  voiceConnection = joinVoiceChannel({
-    channelId: channel.id,
-    guildId: guild.id,
-    adapterCreator: guild.voiceAdapterCreator,
-    selfDeaf: false,
-    selfMute: false,
-  });
-
-  voiceConnection.on('stateChange', (oldState, newState) => {
-    console.log(`Voice connection state: ${oldState.status} -> ${newState.status}`);
-  });
-
-  voiceConnection.on('error', (err) => {
-    console.error('Voice connection error:', err);
-  });
-
-  await entersState(voiceConnection, VoiceConnectionStatus.Ready, 30000);
 
   if (!audioPlayer) {
     audioPlayer = createAudioPlayer();
@@ -699,10 +673,67 @@ async function ensureVoiceConnection() {
     });
   }
 
-  voiceConnection.subscribe(audioPlayer);
-  console.log('Voice connection ready and player subscribed');
+  const connectOnce = async () => {
+    if (voiceConnection) {
+      try {
+        voiceConnection.removeAllListeners();
+      } catch {}
 
-  return voiceConnection;
+      try {
+        voiceConnection.destroy();
+      } catch {}
+
+      voiceConnection = null;
+    }
+
+    voiceConnection = joinVoiceChannel({
+      channelId: channel.id,
+      guildId: guild.id,
+      adapterCreator: guild.voiceAdapterCreator,
+      selfDeaf: false,
+      selfMute: false,
+    });
+
+    voiceConnection.on('stateChange', (oldState, newState) => {
+      console.log(`Voice connection state: ${oldState.status} -> ${newState.status}`);
+    });
+
+    voiceConnection.on('error', (err) => {
+      console.error('Voice connection error:', err);
+    });
+
+    voiceConnection.subscribe(audioPlayer);
+
+    await entersState(voiceConnection, VoiceConnectionStatus.Ready, 20000);
+    console.log('Voice connection ready and player subscribed');
+
+    return voiceConnection;
+  };
+
+  const currentStatus = voiceConnection?.state?.status;
+
+  if (currentStatus === VoiceConnectionStatus.Ready) {
+    return voiceConnection;
+  }
+
+  try {
+    return await connectOnce();
+  } catch (firstError) {
+    console.error('First voice connection attempt failed:', firstError);
+
+    try {
+      if (voiceConnection) {
+        voiceConnection.destroy();
+      }
+    } catch {}
+
+    voiceConnection = null;
+
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    console.log('Retrying voice connection...');
+    return await connectOnce();
+  }
 }
 
 function createTtsResource(text) {
@@ -731,7 +762,7 @@ function createTtsResource(text) {
               '-analyzeduration',
               '0',
               '-loglevel',
-              'debug',
+              'error',
               '-i',
               'pipe:0',
               '-f',
@@ -782,22 +813,33 @@ async function speakText(text) {
 
   try {
     while (speechQueue.length > 0) {
-      await ensureVoiceConnection();
-
       const nextText = speechQueue.shift();
+
+      try {
+        await ensureVoiceConnection();
+      } catch (error) {
+        console.error(
+          'Unable to establish voice connection, skipping speech:',
+          error
+        );
+        continue;
+      }
+
       console.log('Speaking:', nextText);
 
-      const resource = await createTtsResource(nextText);
-      audioPlayer.play(resource);
+      try {
+        const resource = await createTtsResource(nextText);
+        audioPlayer.play(resource);
 
-      await entersState(audioPlayer, AudioPlayerStatus.Playing, 10000);
-      console.log('Audio started playing');
+        await entersState(audioPlayer, AudioPlayerStatus.Playing, 10000);
+        console.log('Audio started playing');
 
-      await entersState(audioPlayer, AudioPlayerStatus.Idle, 30000);
-      console.log('Audio finished');
+        await entersState(audioPlayer, AudioPlayerStatus.Idle, 30000);
+        console.log('Audio finished');
+      } catch (error) {
+        console.error('Playback failed for speech:', nextText, error);
+      }
     }
-  } catch (error) {
-    console.error('Voice speech error', error);
   } finally {
     isSpeaking = false;
   }
@@ -827,12 +869,16 @@ async function processVoiceAnnouncements() {
         !warnedCallTimes.has(warnKey)
       ) {
         warnedCallTimes.add(warnKey);
-        await speakText(`${row.gameName}, get ready.`);
+        speakText(`${row.gameName}, get ready.`).catch((error) => {
+          console.error('Get ready speech failed:', error);
+        });
       }
 
       if (now >= callTime && !announcedCallTimes.has(announceKey)) {
         announcedCallTimes.add(announceKey);
-        await speakText(`${group.name}. ${row.gameName}, send now.`);
+        speakText(`${group.name}. ${row.gameName}, send now.`).catch((error) => {
+          console.error('Send now speech failed:', error);
+        });
       }
 
       if (now > callTime + 60000) {
@@ -953,10 +999,13 @@ client.once(Events.ClientReady, async () => {
     );
   }, 250);
 
-  setTimeout(() => {
-    speakText('Battle Station online').catch((error) =>
-      console.error('Startup speech test failed', error)
-    );
+  setTimeout(async () => {
+    try {
+      await ensureVoiceConnection();
+      console.log('Startup voice check complete');
+    } catch (error) {
+      console.error('Startup voice check failed', error);
+    }
   }, 10000);
 });
 
