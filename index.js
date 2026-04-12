@@ -673,7 +673,17 @@ async function ensureVoiceConnection() {
     });
   }
 
-  const connectOnce = async () => {
+  const attachConnectionListeners = (connection) => {
+    connection.on('stateChange', (oldState, newState) => {
+      console.log(`Voice connection state: ${oldState.status} -> ${newState.status}`);
+    });
+
+    connection.on('error', (err) => {
+      console.error('Voice connection error:', err);
+    });
+  };
+
+  const createFreshConnection = async () => {
     if (voiceConnection) {
       try {
         voiceConnection.removeAllListeners();
@@ -690,18 +700,11 @@ async function ensureVoiceConnection() {
       channelId: channel.id,
       guildId: guild.id,
       adapterCreator: guild.voiceAdapterCreator,
-      selfDeaf: false,
+      selfDeaf: true,
       selfMute: false,
     });
 
-    voiceConnection.on('stateChange', (oldState, newState) => {
-      console.log(`Voice connection state: ${oldState.status} -> ${newState.status}`);
-    });
-
-    voiceConnection.on('error', (err) => {
-      console.error('Voice connection error:', err);
-    });
-
+    attachConnectionListeners(voiceConnection);
     voiceConnection.subscribe(audioPlayer);
 
     await entersState(voiceConnection, VoiceConnectionStatus.Ready, 20000);
@@ -710,29 +713,33 @@ async function ensureVoiceConnection() {
     return voiceConnection;
   };
 
-  const currentStatus = voiceConnection?.state?.status;
+  if (voiceConnection) {
+    const status = voiceConnection.state.status;
 
-  if (currentStatus === VoiceConnectionStatus.Ready) {
-    return voiceConnection;
+    if (status === VoiceConnectionStatus.Ready) {
+      return voiceConnection;
+    }
+
+    if (
+      status === VoiceConnectionStatus.Connecting ||
+      status === VoiceConnectionStatus.Signalling
+    ) {
+      try {
+        await entersState(voiceConnection, VoiceConnectionStatus.Ready, 15000);
+        console.log('Existing voice connection became ready');
+        return voiceConnection;
+      } catch (error) {
+        console.error('Existing voice connection did not become ready:', error);
+      }
+    }
   }
 
   try {
-    return await connectOnce();
+    return await createFreshConnection();
   } catch (firstError) {
-    console.error('First voice connection attempt failed:', firstError);
-
-    try {
-      if (voiceConnection) {
-        voiceConnection.destroy();
-      }
-    } catch {}
-
-    voiceConnection = null;
-
+    console.error('First fresh voice connection attempt failed:', firstError);
     await new Promise((resolve) => setTimeout(resolve, 3000));
-
-    console.log('Retrying voice connection...');
-    return await connectOnce();
+    return await createFreshConnection();
   }
 }
 
@@ -998,15 +1005,6 @@ client.once(Events.ClientReady, async () => {
       console.error('Failed to process voice announcements', error)
     );
   }, 250);
-
-  setTimeout(async () => {
-    try {
-      await ensureVoiceConnection();
-      console.log('Startup voice check complete');
-    } catch (error) {
-      console.error('Startup voice check failed', error);
-    }
-  }, 10000);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
