@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
 const https = require('https');
+const { execSync } = require('child_process');
 const {
   ActionRowBuilder,
   ButtonBuilder,
@@ -49,6 +50,14 @@ if (!TOKEN || !SVS_CHANNEL_ID || !VOICE_CHANNEL_ID || !GUILD_ID) {
     GUILD_ID: !!GUILD_ID,
   });
   process.exit(1);
+}
+
+try {
+  const ffmpegVersion = execSync('ffmpeg -version', { encoding: 'utf8' });
+  console.log('FFmpeg found:', ffmpegVersion.split('\n')[0]);
+} catch (err) {
+  console.error('FFmpeg is NOT installed or not in PATH');
+  console.error(err.message);
 }
 
 const client = new Client({
@@ -672,19 +681,27 @@ async function ensureVoiceConnection() {
     console.log(`Voice connection state: ${oldState.status} -> ${newState.status}`);
   });
 
+  voiceConnection.on('error', (err) => {
+    console.error('Voice connection error:', err);
+  });
+
   await entersState(voiceConnection, VoiceConnectionStatus.Ready, 30000);
 
   if (!audioPlayer) {
     audioPlayer = createAudioPlayer();
+
     audioPlayer.on('stateChange', (oldState, newState) => {
       console.log(`Audio player state: ${oldState.status} -> ${newState.status}`);
     });
+
     audioPlayer.on('error', (error) => {
       console.error('Audio player error', error);
     });
   }
 
   voiceConnection.subscribe(audioPlayer);
+  console.log('Voice connection ready and player subscribed');
+
   return voiceConnection;
 }
 
@@ -697,14 +714,24 @@ function createTtsResource(text) {
         host: 'https://translate.google.com',
       });
 
+      console.log('TTS URL created for:', text);
+
       https
         .get(url, (res) => {
+          console.log('TTS HTTP status:', res.statusCode);
+          console.log('TTS content-type:', res.headers['content-type']);
+
+          if (res.statusCode !== 200) {
+            reject(new Error(`TTS request failed with status ${res.statusCode}`));
+            return;
+          }
+
           const transcoder = new prism.FFmpeg({
             args: [
               '-analyzeduration',
               '0',
               '-loglevel',
-              '0',
+              'debug',
               '-i',
               'pipe:0',
               '-f',
@@ -717,15 +744,30 @@ function createTtsResource(text) {
             ],
           });
 
-          transcoder.on('error', reject);
-          res.on('error', reject);
+          transcoder.on('error', (err) => {
+            console.error('FFmpeg transcoder error:', err);
+            reject(err);
+          });
+
+          res.on('error', (err) => {
+            console.error('HTTPS response stream error:', err);
+            reject(err);
+          });
+
           res.pipe(transcoder);
 
-          const resource = createAudioResource(transcoder);
+          const resource = createAudioResource(transcoder, {
+            inlineVolume: true,
+          });
+
           resolve(resource);
         })
-        .on('error', reject);
+        .on('error', (err) => {
+          console.error('HTTPS GET error:', err);
+          reject(err);
+        });
     } catch (error) {
+      console.error('createTtsResource setup error:', error);
       reject(error);
     }
   });
@@ -749,7 +791,10 @@ async function speakText(text) {
       audioPlayer.play(resource);
 
       await entersState(audioPlayer, AudioPlayerStatus.Playing, 10000);
+      console.log('Audio started playing');
+
       await entersState(audioPlayer, AudioPlayerStatus.Idle, 30000);
+      console.log('Audio finished');
     }
   } catch (error) {
     console.error('Voice speech error', error);
